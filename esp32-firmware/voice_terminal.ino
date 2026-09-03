@@ -24,13 +24,27 @@
      -> release -> STOP -> WAV header patched -> UPLOADING
      -> voice-upload (device_key + WAV) -> transcript (server-side,
         broadcast to the browser over Realtime — this firmware does not
-        see the transcript) -> POLLING voice-fetch for the TTS reply
-     -> PLAYING: response WAV downloaded to LittleFS, its RIFF/fmt/data
-        header parsed at runtime (see parseWavHeader) rather than
-        assuming a fixed format, then streamed PCM->I2S TX -> IDLE.
+        see the transcript) -> on HTTP 200, /recording.wav is DELETED
+        (it's already durably uploaded, never read back locally) ->
+        POLLING voice-fetch for the TTS reply
+     -> PLAYING: response WAV downloaded to LittleFS (space-checked
+        against free bytes before writing, every write's return value
+        checked, short/failed downloads discarded rather than played),
+        its RIFF/fmt/data header validated then parsed at runtime (see
+        validateWavFile/parseWavHeader) rather than assuming a fixed
+        format, streamed PCM->I2S TX, then /response.wav is DELETED
+        whether playback succeeded or failed -> IDLE.
         No MP3 decoder — the backend's speak() now requests Sarvam's
         "wav"/PCM codec instead of MP3, so the bytes voice-fetch returns
         are already playable PCM once past the WAV header.
+
+   LittleFS lifecycle (the actual fix for a "No more free space" error
+   seen in testing): at most ONE large WAV file exists on the filesystem
+   at any moment. /recording.wav is removed immediately after a
+   confirmed-successful upload, BEFORE polling/downloading the reply
+   begins — previously it was left in place, so a ~1.4MB recording plus
+   an incoming ~1.4MB response together exceeded the partition's
+   capacity and produced a truncated, unparseable response.wav.
 
    A new touch while BUSY (anything other than IDLE) is ignored — see
    the state machine below. This is deliberate: half-duplex push-to-talk
@@ -176,6 +190,7 @@ bool pollAndPlayResponse();
 
 struct WavInfo; // full definition below, near parseWavHeader/playWavFile
 bool parseWavHeader(File &f, WavInfo &info);
+bool validateWavFile(const String &path);
 bool playWavFile(const String &path);
 
 // ============================================================
@@ -258,7 +273,7 @@ void loop() {
 // ============================================================
 
 void onTouchDown(unsigned long now) {
-  Serial.println("TOUCH DOWN");
+  Serial.println("[TOUCH] Pressed");
 
   if (state == ST_IDLE || state == ST_SETUP_GESTURE) {
     // Could be the start of a genuine push-to-talk OR the next tap of an
@@ -280,7 +295,7 @@ void onTouchDown(unsigned long now) {
 }
 
 void onTouchRelease(unsigned long now) {
-  Serial.println("TOUCH UP / RELEASE");
+  Serial.println("[TOUCH] Released");
 
   if (state != ST_RECORDING) return; // release with nothing active — ignore
 
@@ -305,22 +320,57 @@ void onTouchRelease(unsigned long now) {
 
   // ---- this was a genuine push-to-talk hold ----
   tapCount = 0; // a real hold cancels any in-progress tap sequence
-  Serial.println("STOP RECORDING");
+  Serial.println("[RECORD] Released — finalizing.");
   finalizeRecording();
 
   state = ST_UPLOADING;
+  Serial.println("[UPLOAD] Uploading...");
   bool uploaded = uploadRecording();
 
   if (!uploaded) {
-    Serial.println("UPLOAD_ERROR — returning to IDLE.");
+    Serial.println("[ERROR] Upload failed — returning to IDLE.");
+    // Recording is still on LittleFS here on purpose: if upload failed
+    // (network blip, server error) the file isn't yet known-consumed by
+    // the backend, so it's kept rather than discarded — a future retry
+    // policy could re-upload it. It IS removed below on the success path,
+    // which is the actual fix for this bug: two ~1.4MB files (a lingering
+    // recording.wav plus an incoming response.wav) is what exhausted
+    // LittleFS and produced the truncated, unparseable response.wav.
     state = ST_IDLE;
     return;
   }
+  Serial.println("[UPLOAD] HTTP 200 — upload successful.");
+
+  // ---- FIX: free the recording's space before downloading the reply ----
+  // The recording has already been durably accepted by voice-upload (we
+  // only reach here on a confirmed HTTP 200) and is not needed locally
+  // again — nothing in this firmware ever reads it back. Removing it now,
+  // before polling starts, is what keeps at most ONE large WAV on
+  // LittleFS at any time, which is the actual fix: this device's
+  // LittleFS partition cannot hold a ~1.4MB recording AND a ~1.4MB
+  // response simultaneously.
+  Serial.println("[FS] Removing recording.wav");
+  if (recordingFile) recordingFile.close(); // defensive: finalizeRecording() already closed it, but never leave a handle open before a remove()
+  if (LittleFS.exists(RECORDING_PATH)) {
+    if (LittleFS.remove(RECORDING_PATH)) {
+      Serial.println("[FS] recording.wav removed");
+    } else {
+      Serial.println("[ERROR] Failed to remove recording.wav — continuing anyway, but LittleFS space is now at risk.");
+    }
+  }
+  if (LittleFS.exists(RECORDING_PATH)) {
+    // Verify removal actually took effect, per the requirement — a
+    // filesystem remove() can nominally return true while the entry is
+    // still present under some corruption/error conditions worth
+    // catching explicitly rather than assuming success.
+    Serial.println("[ERROR] recording.wav still exists after remove() — LittleFS may be in a bad state.");
+  }
+  Serial.printf("[FS] Free space: %u / %u bytes\n", (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()), (unsigned)LittleFS.totalBytes());
 
   state = ST_POLLING;
   bool played = pollAndPlayResponse();
   if (!played) {
-    Serial.println("No TTS response received within timeout (or playback failed) — IDLE.");
+    Serial.println("[ERROR] No TTS response played this cycle (timeout, download, or playback failure — see logs above).");
   }
   state = ST_IDLE;
   Serial.println("=== Cycle complete, back to IDLE ===\n");
@@ -449,7 +499,7 @@ void patchWavHeader(File &f, uint32_t dataBytes) {
 }
 
 void beginRecording() {
-  Serial.println("START RECORDING");
+  Serial.println("[RECORD] Started");
 
   if (LittleFS.exists(RECORDING_PATH)) LittleFS.remove(RECORDING_PATH);
   recordingFile = LittleFS.open(RECORDING_PATH, FILE_WRITE);
@@ -506,7 +556,7 @@ void finalizeRecording() {
   i2sTeardown();
   patchWavHeader(recordingFile, recordedBytes);
   recordingFile.close();
-  Serial.printf("Recording finalized: %u bytes PCM (%.2fs)\n",
+  Serial.printf("[RECORD] Finalized WAV: %u bytes PCM (%.2fs)\n",
                 recordedBytes, recordedBytes / (float)(SAMPLE_RATE * 2));
 }
 
@@ -608,7 +658,7 @@ bool uploadRecording() {
 // ============================================================
 
 bool pollAndPlayResponse() {
-  Serial.println("POLLING for TTS response");
+  Serial.println("[POLL] Waiting for response...");
   unsigned long start = millis();
 
   while ((millis() - start) < POLL_TIMEOUT_MS) {
@@ -632,29 +682,72 @@ bool pollAndPlayResponse() {
     }
 
     if (code == 200) {
-      Serial.println("TTS audio available — downloading.");
+      Serial.println("[POLL] Response received");
       WiFiClient *stream = http.getStreamPtr();
-      int len = http.getSize();
+      int len = http.getSize(); // Content-Length; -1 if the server didn't send one
 
+      // ---- FIX 1: always start from a clean slate ----
       if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
+
+      // ---- FIX 2: verify there is room BEFORE writing anything ----
+      // Leave headroom rather than racing the exact free-byte count —
+      // LittleFS itself has bookkeeping/metadata overhead per write, so
+      // "free bytes == payload bytes" is not actually safe.
+      const uint32_t FS_HEADROOM_BYTES = 8192;
+      uint32_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+      if (len > 0 && (uint32_t)len + FS_HEADROOM_BYTES > freeBytes) {
+        Serial.printf("[PLAYBACK_ERROR] Not enough LittleFS space for response WAV (need ~%d + %u headroom, have %u free)\n",
+                      len, FS_HEADROOM_BYTES, freeBytes);
+        http.end();
+        return false;
+      }
+      if (len <= 0) {
+        // Server didn't send Content-Length (chunked, or omitted) — can't
+        // pre-check exact size, but can still refuse to even start if
+        // free space is already critically low.
+        Serial.printf("[FS] Content-Length unknown; free space check limited to current headroom (%u bytes free)\n", freeBytes);
+        if (freeBytes < FS_HEADROOM_BYTES) {
+          Serial.println("[PLAYBACK_ERROR] Not enough LittleFS space for response WAV");
+          http.end();
+          return false;
+        }
+      } else {
+        Serial.printf("[FS] Enough space for response (%d bytes needed, %u free)\n", len, freeBytes);
+      }
+
       File out = LittleFS.open(RESPONSE_PATH, FILE_WRITE);
       if (!out) {
-        Serial.println("PLAYBACK_ERROR: could not open response file for write.");
+        Serial.println("[PLAYBACK_ERROR] could not open response file for write.");
         http.end();
         return false;
       }
 
+      // ---- FIX 3: track expected/received/written bytes, verify every write ----
       uint8_t buf[512];
-      int written = 0;
+      uint32_t received = 0;   // bytes read from the network
+      uint32_t writtenOk = 0;  // bytes CONFIRMED written to LittleFS (write() return value, not just requested)
+      bool writeFailed = false;
       unsigned long dlStart = millis();
-      while (http.connected() && (len < 0 || written < len)) {
+
+      while (http.connected() && (len < 0 || (int)received < len)) {
         size_t avail = stream->available();
         if (avail) {
           int n = stream->readBytes(buf, min((size_t)sizeof(buf), avail));
-          out.write(buf, n);
-          written += n;
+          received += n;
+
+          size_t w = out.write(buf, n);
+          if (w != (size_t)n) {
+            // Do NOT assume out.write(buf, n) wrote all n bytes — per the
+            // requirement, check the actual return value every time.
+            Serial.printf("[PLAYBACK_ERROR] LittleFS write failed (requested %d, wrote %u)\n", n, (unsigned)w);
+            writeFailed = true;
+            break;
+          }
+          writtenOk += w;
+          dlStart = millis(); // reset stall timer on real progress
         } else if ((millis() - dlStart) > 15000) {
-          Serial.println("PLAYBACK_ERROR: download stalled, aborting.");
+          Serial.println("[PLAYBACK_ERROR] download stalled, aborting.");
+          writeFailed = true;
           break;
         }
         delay(1);
@@ -662,9 +755,40 @@ bool pollAndPlayResponse() {
       out.close();
       http.end();
 
-      Serial.printf("Downloaded %d bytes to %s\n", written, RESPONSE_PATH);
+      // A short read (connection closed before `len` bytes arrived) is the
+      // same class of problem as a failed write: an incomplete file must
+      // not be handed to the WAV parser/playback path.
+      bool shortRead = (len > 0 && (int)received < len);
+
+      if (writeFailed || shortRead) {
+        Serial.printf("[PLAYBACK_ERROR] Response WAV incomplete (expected=%d received=%u written=%u)\n",
+                      len, received, writtenOk);
+        Serial.println("[PLAYBACK_ERROR] Response WAV discarded");
+        if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
+        return false;
+      }
+
+      Serial.printf("Downloaded %u bytes to %s\n", writtenOk, RESPONSE_PATH);
+
+      // ---- FIX 4: validate the WAV header BEFORE attempting playback ----
+      if (!validateWavFile(RESPONSE_PATH)) {
+        if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
+        return false;
+      }
+      Serial.println("[PLAY] WAV validated");
+
       bool played = playWavFile(RESPONSE_PATH);
-      if (!played) Serial.println("PLAYBACK_ERROR: WAV parse/playback failed.");
+      if (!played) {
+        Serial.println("[PLAYBACK_ERROR] WAV parse/playback failed.");
+      }
+
+      // ---- Always delete response.wav after we're done with it, win or lose ----
+      if (LittleFS.exists(RESPONSE_PATH)) {
+        LittleFS.remove(RESPONSE_PATH);
+        Serial.println("[FS] response.wav deleted");
+      }
+      Serial.printf("[FS] Free space: %u / %u bytes\n", (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()), (unsigned)LittleFS.totalBytes());
+
       return played;
     }
 
@@ -795,6 +919,44 @@ bool parseWavHeader(File &f, WavInfo &info) {
   return true;
 }
 
+// Cheap pre-flight check run BEFORE playWavFile()/the I2S path is ever
+// touched — deliberately separate from parseWavHeader()'s full chunk walk
+// (which playWavFile still does on its own right before playback) so a
+// corrupt/truncated download is rejected as early and cheaply as possible:
+// file exists, size is plausible for a WAV (>44-byte header at minimum),
+// and the first 12 bytes actually are "RIFF"...."WAVE" before any chunk
+// parsing is attempted at all.
+bool validateWavFile(const String &path) {
+  if (!LittleFS.exists(path)) {
+    Serial.println("[PLAYBACK_ERROR] response file does not exist.");
+    return false;
+  }
+
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("[PLAYBACK_ERROR] could not open response file for validation.");
+    return false;
+  }
+
+  size_t fileSize = f.size();
+  if (fileSize <= 44) { // must have at least a full canonical WAV header
+    Serial.printf("[PLAYBACK_ERROR] response file too small to be a valid WAV (%u bytes)\n", (unsigned)fileSize);
+    f.close();
+    return false;
+  }
+
+  uint8_t header[12];
+  size_t readN = f.read(header, 12);
+  f.close();
+
+  if (readN != 12 || memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
+    Serial.println("[PLAYBACK_ERROR] response file is not a valid RIFF/WAVE file.");
+    return false;
+  }
+
+  return true;
+}
+
 // Streams PCM from LittleFS to I2S TX in small chunks — never loads the
 // whole file into RAM, matching the same approach used for recording.
 //
@@ -826,7 +988,7 @@ bool playWavFile(const String &path) {
   f.seek(info.dataOffset);
   i2sConfigureTx(info.sampleRate, info.bitsPerSample, info.numChannels);
 
-  Serial.println("PLAY START");
+  Serial.println("[PLAY] Starting WAV");
 
   const size_t CHUNK = 512;
   uint8_t buf[CHUNK];
@@ -843,7 +1005,7 @@ bool playWavFile(const String &path) {
 
   f.close();
   i2sTeardown();
-  Serial.println("PLAY END");
+  Serial.println("[PLAY] Finished");
   return true;
 }
 
