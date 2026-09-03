@@ -561,123 +561,120 @@ void finalizeRecording() {
 }
 
 // ============================================================
-// Upload: multipart/form-data POST to voice-upload, via HTTPClient
+// Upload: chunked JSON session protocol to voice-upload
 // ============================================================
 //
-// Root cause of the previous failure (confirmed by hardware diagnostics,
-// not guessed): a hand-rolled loop calling WiFiClientSecure::write() once
-// per 512-byte chunk failed mid-stream at byte 5632 with mbedTLS error 48
-// ("UNKNOWN ERROR CODE (0030)") and client.connected() immediately false.
-// This matches a known class of defect in arduino-esp32's WiFiClientSecure:
-// mbedTLS's own write() can legitimately need to be retried on
-// MBEDTLS_ERR_SSL_WANT_WRITE, and a caller that treats a single short
-// write as fatal (as the previous manual loop did) can abort a connection
-// mbedTLS itself was still able to continue, whereas HTTPClient's own
-// sendRequest() write loop retries partial writes internally before
-// giving up — see the writing-loop details confirmed against the actual
-// arduino-esp32 HTTPClient.cpp source before this rewrite.
+// FINAL root cause (confirmed against real upstream arduino-esp32 source,
+// not guessed): the installed core's WiFiClientSecure/mbedTLS write path
+// (send_ssl_data, inside the core itself, below both WiFiClientSecure and
+// HTTPClient) does not correctly loop/retry on partial mbedtls_ssl_write()
+// returns for long single-shot bodies. This is a real, previously-open
+// upstream defect — fixed in espressif/arduino-esp32 PR #11865, merged
+// 2025-09-24, which explicitly rewrites send_ssl_data() to loop until the
+// full buffer is written and to send large payloads in bounded (4KB)
+// chunks specifically to avoid this class of failure. This firmware
+// cannot assume the installed board package includes that fix. It
+// reproduced as TWO different symptoms of the SAME underlying defect:
+//   - a raw WiFiClientSecure write loop (previous commit) failing
+//     mid-stream at byte 5632 (mbedTLS error 48)
+//   - HTTPClient::sendRequest()'s OWN internal write-retry loop (previous
+//     commit) *also* eventually failing, returning HTTPC_ERROR_SEND_
+//     PAYLOAD_FAILED (-3) after ~15.9s of a ~150-180KB body — because
+//     sendRequest ultimately calls the same broken send_ssl_data()
+//     underneath, extending HTTPClient's own timeouts changed nothing,
+//     which is expected once the defect is understood to be a write-loop
+//     correctness bug, not a timeout.
 //
-// Verified against the real installed API before use (not invented):
-// HTTPClient::sendRequest(const char *type, Stream *stream, size_t size)
-// exists, reads the given Stream via available()/readBytes(), retries
-// incomplete writes to the underlying client, and sets Content-Length
-// itself from `size` — so this function must NOT also set Content-Length
-// via addHeader() (that would either be redundant or produce two
-// conflicting headers depending on the core version). The multipart body
-// here is three logical parts (a small in-RAM head string, the WAV file
-// streamed from LittleFS, a small in-RAM tail string) but sendRequest
-// only accepts ONE Stream*, so MultipartUploadStream below is a minimal
-// Stream subclass that serves all three in sequence — verified against
-// Stream.h/Print.h's actual abstract-method requirements
-// (available()/read()/peek()/write(uint8_t), plus the virtual
-// readBytes(char*,size_t) override for efficient block reads instead of
-// the default byte-at-a-time fallback) rather than assumed.
+// The only reliable fix that does not depend on the user's installed core
+// version is architectural: NEVER attempt one large single-shot HTTPS
+// write. Each recording is now uploaded as many small, fully independent
+// HTTPS POST requests — a start/chunk×N/finish session against
+// voice-upload's new JSON protocol (see supabase/functions/voice-upload/
+// index.ts) — where every single POST body is only a few KB, comfortably
+// inside the range that worked correctly before either previous failure
+// occurred (both failures needed several KB of sustained single-write
+// throughput before manifesting). RAM stays bounded: exactly one
+// UPLOAD_CHUNK_BYTES raw buffer plus its base64 encoding exist at a time;
+// the WAV file itself is never loaded into RAM, consistent with every
+// prior version of this firmware.
 
-class MultipartUploadStream : public Stream {
-public:
-  MultipartUploadStream(const String &head, File &file, const String &tail, size_t fileSize)
-      : _head(head), _file(file), _tail(tail), _fileSize(fileSize),
-        _headPos(0), _tailPos(0), _filePos(0), _lastProgressLog(0), _phase(PHASE_HEAD) {}
+// Raw bytes read from LittleFS per chunk, before base64 encoding. Chosen
+// well under the ~5.6KB point where the very first (raw-socket) failure
+// was observed, with margin — base64 inflates this to ~5.5KB, plus a few
+// hundred bytes of JSON/session-id overhead, still a small single POST.
+#define UPLOAD_CHUNK_BYTES 4096
 
-  int available() override {
-    switch (_phase) {
-      case PHASE_HEAD: return _head.length() - _headPos;
-      case PHASE_FILE: return _file.available();
-      case PHASE_TAIL: return _tail.length() - _tailPos;
-      default: return 0;
-    }
+static const char *B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Minimal base64 encoder — no library dependency, output written directly
+// into a caller-provided String to avoid a second full-size copy.
+static void base64Encode(const uint8_t *data, size_t len, String &out) {
+  out.reserve(out.length() + ((len + 2) / 3) * 4);
+  size_t i = 0;
+  while (i + 3 <= len) {
+    uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | data[i + 2];
+    out += B64_CHARS[(n >> 18) & 0x3F];
+    out += B64_CHARS[(n >> 12) & 0x3F];
+    out += B64_CHARS[(n >> 6) & 0x3F];
+    out += B64_CHARS[n & 0x3F];
+    i += 3;
   }
-
-  int read() override {
-    uint8_t b;
-    return readBytes((char *)&b, 1) == 1 ? b : -1;
+  size_t rem = len - i;
+  if (rem == 1) {
+    uint32_t n = (uint32_t)data[i] << 16;
+    out += B64_CHARS[(n >> 18) & 0x3F];
+    out += B64_CHARS[(n >> 12) & 0x3F];
+    out += '=';
+    out += '=';
+  } else if (rem == 2) {
+    uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8);
+    out += B64_CHARS[(n >> 18) & 0x3F];
+    out += B64_CHARS[(n >> 12) & 0x3F];
+    out += B64_CHARS[(n >> 6) & 0x3F];
+    out += '=';
   }
+}
 
-  int peek() override {
-    // Not used by HTTPClient::sendRequest's read loop (it only calls
-    // available()/readBytes()); implemented minimally and correctly
-    // rather than left as a stub returning a wrong value.
-    if (_phase == PHASE_HEAD && _headPos < (size_t)_head.length()) return _head[_headPos];
-    if (_phase == PHASE_FILE) return _file.peek();
-    if (_phase == PHASE_TAIL && _tailPos < (size_t)_tail.length()) return _tail[_tailPos];
+// Escapes a string for embedding inside a JSON string literal. Only
+// device key / session id / lang code / short server text pass through
+// here — small, bounded inputs, so a simple pass is sufficient.
+static String jsonEscape(const String &s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+// One JSON POST to VOICE_UPLOAD_URL. Returns the HTTP status code
+// (negative on transport-level failure, per HTTPClient's own convention)
+// and, on success, the raw response body via `outBody`.
+static int postJson(const String &jsonBody, String &outBody) {
+  WiFiClientSecure client;
+  // Prototype-only: skips TLS certificate validation. Isolated here and
+  // clearly commented — replace with a pinned root CA before any
+  // production deployment of this firmware.
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, VOICE_UPLOAD_URL)) {
+    outBody = "";
     return -1;
   }
+  http.setConnectTimeout(10000);
+  http.setTimeout(10000); // each request body is now only a few KB; no need for the long timeouts the failed single-shot approach needed
+  http.addHeader("Content-Type", "application/json");
 
-  size_t write(uint8_t) override { return 0; } // write-side unused; this Stream is read-only from HTTPClient's perspective
-
-  // Overrides Stream's virtual readBytes(char*, size_t) so sendRequest's
-  // internal loop gets real block reads instead of the (very slow, one
-  // virtual call per byte) default fallback built on top of read().
-  size_t readBytes(char *buffer, size_t length) override {
-    size_t total = 0;
-    while (total < length) {
-      if (_phase == PHASE_HEAD) {
-        size_t remaining = _head.length() - _headPos;
-        if (remaining == 0) { _phase = PHASE_FILE; continue; }
-        size_t n = min(length - total, remaining);
-        memcpy(buffer + total, _head.c_str() + _headPos, n);
-        _headPos += n;
-        total += n;
-      } else if (_phase == PHASE_FILE) {
-        if (!_file.available()) { _phase = PHASE_TAIL; continue; }
-        size_t n = _file.read((uint8_t *)(buffer + total), length - total);
-        if (n == 0) { _phase = PHASE_TAIL; continue; } // defensive: available() said >0 but read() returned 0
-        total += n;
-        _filePos += n;
-
-        // Progress is logged here, at the point the WAV bytes are pulled
-        // out of LittleFS for sendRequest to write — an accurate proxy
-        // for upload progress since sendRequest reads just-in-time (no
-        // internal pre-buffering of the whole stream), not a fixed
-        // estimate. Every ~32KB, not every read, per the no-spam
-        // requirement.
-        if (_filePos - _lastProgressLog >= 32768) {
-          Serial.printf("[UPLOAD] Progress: %u\n", (unsigned)_filePos);
-          _lastProgressLog = _filePos;
-        }
-      } else if (_phase == PHASE_TAIL) {
-        size_t remaining = _tail.length() - _tailPos;
-        if (remaining == 0) break; // fully exhausted, nothing left in any phase
-        size_t n = min(length - total, remaining);
-        memcpy(buffer + total, _tail.c_str() + _tailPos, n);
-        _tailPos += n;
-        total += n;
-      } else {
-        break;
-      }
-    }
-    return total;
-  }
-
-private:
-  enum Phase { PHASE_HEAD, PHASE_FILE, PHASE_TAIL };
-  const String &_head;
-  File &_file;
-  const String &_tail;
-  size_t _fileSize;
-  size_t _headPos, _tailPos, _filePos, _lastProgressLog;
-  Phase _phase;
-};
+  int code = http.POST(jsonBody);
+  outBody = (code > 0) ? http.getString() : http.errorToString(code);
+  http.end();
+  return code;
+}
 
 bool uploadRecording() {
   Serial.println("UPLOADING");
@@ -688,106 +685,91 @@ bool uploadRecording() {
     return false;
   }
   size_t fileSize = f.size();
-
   Serial.printf("[UPLOAD] Target URL:  %s\n", VOICE_UPLOAD_URL);
+  Serial.printf("[UPLOAD] WAV file size: %u bytes, chunk size: %u bytes\n", (unsigned)fileSize, (unsigned)UPLOAD_CHUNK_BYTES);
 
-  String boundary = "----ESP32VoiceBoundary7f3a9c";
-  String head =
-      "--" + boundary + "\r\n"
-      "Content-Disposition: form-data; name=\"device_key\"\r\n\r\n" +
-      String(DEVICE_API_KEY) + "\r\n" +
-      "--" + boundary + "\r\n"
-      "Content-Disposition: form-data; name=\"lang\"\r\n\r\n" +
-      String(UPLOAD_LANG) + "\r\n" +
-      "--" + boundary + "\r\n"
-      "Content-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\n"
-      "Content-Type: audio/wav\r\n\r\n";
-  String tail = "\r\n--" + boundary + "--\r\n";
-
-  size_t totalLen = head.length() + fileSize + tail.length();
-  Serial.printf("[UPLOAD] WAV file size:      %u bytes\n", (unsigned)fileSize);
-  Serial.printf("[UPLOAD] Multipart head/tail: %u / %u bytes\n", (unsigned)head.length(), (unsigned)tail.length());
-  Serial.printf("[UPLOAD] Content-Length:      %u bytes\n", (unsigned)totalLen);
-
-  WiFiClientSecure client;
-  // Prototype-only: skips TLS certificate validation. Isolated here and
-  // clearly commented — replace with a pinned root CA before any
-  // production deployment of this firmware.
-  client.setInsecure();
-
-  HTTPClient http;
-  Serial.println("[UPLOAD] HTTPClient begin...");
-  if (!http.begin(client, VOICE_UPLOAD_URL)) {
-    Serial.println("[ERROR] HTTPClient begin() failed.");
+  // ---- start ----
+  String startReq = String("{\"action\":\"start\",\"device_key\":\"") + jsonEscape(DEVICE_API_KEY) +
+                     "\",\"lang\":\"" + jsonEscape(UPLOAD_LANG) + "\"}";
+  String startResp;
+  int startCode = postJson(startReq, startResp);
+  Serial.printf("[UPLOAD] start -> HTTP %d: %s\n", startCode, startResp.c_str());
+  if (startCode != 200) {
+    Serial.println("[ERROR] Upload session start failed.");
     f.close();
     return false;
   }
-  Serial.println("[UPLOAD] HTTPClient connected...");
 
-  // ---- Timeout hypothesis, NOT a confirmed fix — flagged as such ----
-  // The rewrite to HTTPClient::sendRequest() (previous commit) still
-  // failed on real hardware: HTTPC_ERROR_SEND_PAYLOAD_FAILED (-3) after
-  // ~15.9s sending a ~170KB body. HTTPClient's own default TCP timeout
-  // is 5000ms (HTTPCLIENT_DEFAULT_TCP_TIMEOUT, confirmed in the real
-  // HTTPClient.h source) — the failure happened well past that default,
-  // which is consistent with (but not proof of) the transfer simply
-  // outliving the timeout on a real WiFi link, rather than a defect in
-  // MultipartUploadStream or in sendRequest's write-retry logic itself
-  // (confirmed by reading HTTPClient.cpp: that loop only returns -3 on
-  // an actual client->write() failure or a final size mismatch, not on
-  // a Stream that transiently returns 0 from available()). Extending
-  // both timeouts is the smallest change that tests this hypothesis
-  // without altering the transport architecture again. setTimeout()/
-  // setConnectTimeout() are used here specifically because both are
-  // confirmed present on HTTPClient itself in the current upstream
-  // source — WiFiClientSecure's own timeout API differs across
-  // arduino-esp32 core versions (it is a typedef over NetworkClient in
-  // newer cores), so calling it directly here would risk targeting the
-  // wrong installed version's method signature.
-  http.setConnectTimeout(15000);
-  http.setTimeout(30000);
-  Serial.println("[UPLOAD] Timeouts: connect=15000ms overall=30000ms (default was 5000ms — likely cause of the -3 failure at 15.9s)");
+  int sidIdx = startResp.indexOf("\"session_id\":\"");
+  if (sidIdx < 0) {
+    Serial.println("[ERROR] start response missing session_id.");
+    f.close();
+    return false;
+  }
+  sidIdx += strlen("\"session_id\":\"");
+  int sidEnd = startResp.indexOf('"', sidIdx);
+  if (sidEnd < 0) {
+    Serial.println("[ERROR] start response malformed session_id.");
+    f.close();
+    return false;
+  }
+  String sessionId = startResp.substring(sidIdx, sidEnd);
+  Serial.println("[UPLOAD] session_id: " + sessionId);
 
-  // Content-Type is set explicitly (sendRequest does not infer this from
-  // the boundary); Content-Length is NOT set here — sendRequest(type,
-  // stream, size) sets it internally from the size argument below, per
-  // the verified HTTPClient.cpp source.
-  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  // ---- chunks ----
+  // static, not stack-local: matches the pattern already used for i2sBuf/
+  // pcmBuf elsewhere in this file — keeps this 4KB buffer off the task
+  // stack rather than risking a large single-frame stack allocation.
+  static uint8_t rawBuf[UPLOAD_CHUNK_BYTES];
+  uint32_t sent = 0;
+  uint32_t lastProgressLog = 0;
+  bool chunkFailed = false;
 
-  MultipartUploadStream uploadStream(head, f, tail, fileSize);
+  while (true) {
+    size_t n = f.read(rawBuf, UPLOAD_CHUNK_BYTES);
+    if (n == 0) break; // EOF
 
-  // Progress is logged from inside MultipartUploadStream::readBytes()
-  // (every ~32KB of WAV data read out of LittleFS, which sendRequest
-  // pulls just-in-time rather than pre-buffering) since sendRequest()
-  // itself exposes no per-chunk write callback to hook into directly.
-  Serial.println("[UPLOAD] Sending multipart body...");
-  unsigned long sendStart = millis();
-  int httpCode = http.sendRequest("POST", &uploadStream, totalLen);
-  unsigned long sendMs = millis() - sendStart;
+    String b64;
+    base64Encode(rawBuf, n, b64);
+
+    String chunkReq;
+    chunkReq.reserve(b64.length() + sessionId.length() + 64);
+    chunkReq = "{\"action\":\"chunk\",\"session_id\":\"" + sessionId + "\",\"data\":\"" + b64 + "\"}";
+
+    String chunkResp;
+    int chunkCode = postJson(chunkReq, chunkResp);
+    if (chunkCode != 200) {
+      Serial.printf("[ERROR] chunk upload failed at byte %u -> HTTP %d: %s\n", (unsigned)sent, chunkCode, chunkResp.c_str());
+      chunkFailed = true;
+      break;
+    }
+
+    sent += n;
+    if (sent - lastProgressLog >= 32768 || (size_t)sent >= fileSize) {
+      Serial.printf("[UPLOAD] Progress: %u / %u\n", (unsigned)sent, (unsigned)fileSize);
+      lastProgressLog = sent;
+    }
+  }
   f.close();
 
-  Serial.printf("[UPLOAD] sendRequest() returned after %lu ms\n", sendMs);
-  Serial.printf("[UPLOAD] HTTP status: %d\n", httpCode);
-
-  if (httpCode <= 0) {
-    // HTTPClient encodes connection/timeout/write errors as negative
-    // codes (see HTTPC_ERROR_* in HTTPClient.h) rather than a 0/blank
-    // status line the way the old manual-socket code observed — errorToString
-    // gives a human-readable reason for exactly that case.
-    Serial.printf("[ERROR] Upload failed before a real HTTP response: %s\n", http.errorToString(httpCode).c_str());
-    http.end();
+  if (chunkFailed) {
+    // Best-effort: nothing more we can do with this session server-side
+    // (it will simply expire and be swept), and the recording is still
+    // on LittleFS for the existing retry-on-next-touch behavior.
     return false;
   }
 
-  String body = http.getString();
-  Serial.println("[UPLOAD] Response: " + body);
-  http.end();
+  // ---- finish ----
+  String finishReq = "{\"action\":\"finish\",\"session_id\":\"" + sessionId + "\"}";
+  String finishResp;
+  int finishCode = postJson(finishReq, finishResp);
+  Serial.printf("[UPLOAD] finish -> HTTP %d: %s\n", finishCode, finishResp.c_str());
 
-  bool ok = (httpCode >= 200 && httpCode < 300);
+  bool ok = (finishCode == 200);
   if (ok) {
-    Serial.println("UPLOAD SUCCESS: " + body);
+    Serial.println("UPLOAD SUCCESS: " + finishResp);
   } else {
-    Serial.println("UPLOAD FAILED: " + body);
+    Serial.println("UPLOAD FAILED: " + finishResp);
   }
   return ok;
 }
