@@ -25,6 +25,17 @@ const BCP47: Record<string, string> = {
   bn: "bn-IN", gu: "gu-IN", kn: "kn-IN", pa: "pa-IN",
 };
 
+// Where a turn originated. Determines where the reply's voice plays:
+// "browser" -> laptop/browser speaker only (current default behavior).
+// "esp32"   -> the physical terminal's speaker only — the laptop MUST
+// stay silent, since the person who asked isn't necessarily at the
+// laptop at all. This travels send() -> chat reply -> speak() as a
+// plain function argument (never a shared ref) for the same reason
+// autoSend already does: an origin tag read back out of shared state
+// inside an async callback could be clobbered by a second, unrelated
+// turn starting before the first one's reply comes back.
+type TurnOrigin = "browser" | "esp32";
+
 export default function DashboardPage() {
   const router = useRouter();
   const { t } = useI18n();
@@ -241,7 +252,9 @@ export default function DashboardPage() {
         // call produced it) — hand straight to the existing chat pipeline.
         // Deliberately NOT calling chat or speak directly here: send()
         // already owns persisting the turn and triggering speak(reply).
-        send(text);
+        // origin="esp32" here is what makes the reply's voice route to
+        // the physical speaker instead of the laptop — see TurnOrigin.
+        send(text, "esp32");
       })
       .subscribe((status) => {
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
@@ -266,8 +279,29 @@ export default function DashboardPage() {
    * Primary: Sarvam AI Bulbul v3 (natural Indic voices) via the `speak`
    * Edge Function. Fallback: browser speechSynthesis on any failure —
    * missing key, request error, or autoplay blocked.
+   *
+   * origin decides where the resulting audio plays — this is the fix for
+   * "laptop must stay silent for ESP32-originated turns":
+   *   "browser" (default — manual click, typed text, suggestion tap):
+   *     play locally via <audio>, exactly as before. NOT mirrored to the
+   *     device queue — nothing is polling for it, and queuing it would
+   *     be a wasted Storage write plus a stray entry voice-fetch could
+   *     hand the ESP32 on some future unrelated turn.
+   *   "esp32" (the physical button triggered this turn):
+   *     the laptop does NOT call new Audio(...).play() or the
+   *     speechSynthesis fallback at all — only mirrorAudioToDevice()
+   *     runs, queuing the clip for voice-fetch to hand to the ESP32.
+   *     If Sarvam itself fails for an esp32-origin turn, there is
+   *     deliberately no browser-side fallback voice either — falling
+   *     back to speaking on the laptop would defeat the entire point of
+   *     "the physical speaker is the output device" for this turn.
    */
-  async function speak(text: string) {
+  async function speak(text: string, origin: TurnOrigin) {
+    if (origin === "esp32") {
+      await mirrorAudioToDevice(text);
+      return;
+    }
+
     if (muted) return;
 
     const { data: { session } } = await supabase.auth.getSession();
@@ -290,36 +324,57 @@ export default function DashboardPage() {
       const audio = new Audio(`data:${data.mime};base64,${data.audio}`);
       audioRef.current = audio;
       audio.play().catch(() => speakWithBrowser(text));
-
-      // Mirror the same clip to the ESP32 terminal's pickup queue.
-      // Fire-and-forget: browser playback above has already started and
-      // must never wait on, or fail because of, this — a hardware
-      // terminal that's offline, slow, or not yet polling should have
-      // zero effect on the normal website experience.
-      mirrorAudioToDevice(data.audio, data.mime);
     } catch {
       speakWithBrowser(text);
     }
   }
 
-  async function mirrorAudioToDevice(audioBase64: string, mime: string) {
+  // Generates the TTS clip via the SAME `speak` Edge Function used for
+  // browser playback, but only ever queues it for the ESP32 — never
+  // plays it locally. Kept as its own function (rather than inlined into
+  // speak()) so the "esp32 origin" branch above reads as one clear early
+  // return instead of a browser-playback function with a silence flag
+  // threaded through the middle of it.
+  async function mirrorAudioToDevice(text: string) {
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
-      await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/voice-output`, {
+      const speakRes = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/speak`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
-        body: JSON.stringify({ audio: audioBase64, mime }),
+        body: JSON.stringify({ text, lang: BCP47[lang] || "en-IN" }),
       });
-    } catch {
-      // Non-fatal by design — see call site comment. The ESP32 simply
-      // won't have this clip queued; nothing else in the app is affected.
+      const speakData = await speakRes.json();
+      if (!speakRes.ok || speakData.unsupported || !speakData.audio) {
+        console.error("[esp32 voice-output] speak() failed, nothing queued for the device:", speakData.error);
+        return;
+      }
+
+      const outputRes = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/voice-output`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ audio: speakData.audio, mime: speakData.mime }),
+      });
+      if (!outputRes.ok) {
+        console.error("[esp32 voice-output] queue insert failed:", await outputRes.text());
+      }
+    } catch (err) {
+      // Non-fatal by design: a hardware terminal that's offline, slow, or
+      // failing should never break the dashboard's chat UI. The ESP32
+      // simply won't have this reply queued; the user sees the text
+      // reply either way (send() already appended it before speak() runs).
+      console.error("[esp32 voice-output] mirror failed:", err);
     }
   }
 
-  /* ---------- send ---------- */
-  async function send(text: string) {
+  /* ---------- send ----------
+   * origin defaults to "browser" so every EXISTING call site (typed
+   * text, the on-screen mic button, suggestion/scheme buttons) needs no
+   * change at all and keeps playing replies on the laptop exactly as
+   * before. Only the voice_transcript handler above passes "esp32".
+   */
+  async function send(text: string, origin: TurnOrigin = "browser") {
     const question = text.trim();
     if (!question || sending) return;
 
@@ -369,7 +424,7 @@ export default function DashboardPage() {
         citations: data.citations ?? [], created_at: new Date().toISOString(),
       };
       setMessages((m) => [...m, reply]);
-      speak(data.reply);
+      speak(data.reply, origin);
     } catch {
       setMessages((m) => [...m, {
         id: crypto.randomUUID(), conversation_id: "", role: "assistant",
