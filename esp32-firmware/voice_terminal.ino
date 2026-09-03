@@ -1194,8 +1194,25 @@ bool playWavFile(const String &path) {
     i2s_write(I2S_NUM_0, buf, n, &bytesWritten, 100 / portTICK_PERIOD_MS);
     remaining -= n;
   }
-
   f.close();
+
+  // i2s_write() only guarantees the bytes are QUEUED into the DMA buffer
+  // by the time it returns, not that they've actually finished playing
+  // out through the amp/speaker yet -- calling i2sTeardown() (which
+  // uninstalls the I2S driver) immediately after the last write was
+  // cutting the tail of every clip off, exactly matching "it got cut
+  // short". The TX config above sets dma_buf_count=4 * dma_buf_len=256 =
+  // 1024 samples of buffering headroom; at this WAV's own sample rate
+  // that's up to 1024/sampleRate seconds of audio that can still be
+  // sitting in the DMA buffer, unplayed, the instant the last i2s_write()
+  // call returns. The legacy driver.h API used here has no blocking
+  // "wait until the DMA queue is actually empty" call, so this waits
+  // that worst-case duration (plus a small margin) before tearing the
+  // peripheral down, giving the DMA buffer time to actually finish
+  // draining out to the speaker.
+  uint32_t drainMs = (1024UL * 1000UL / info.sampleRate) + 30;
+  delay(drainMs);
+
   i2sTeardown();
   Serial.println("[PLAY] Finished");
   return true;
