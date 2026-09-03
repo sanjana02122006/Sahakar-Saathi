@@ -155,28 +155,57 @@ export default function DashboardPage() {
     startSarvamRecording();
   }, [listening, startSarvamRecording, stopSarvamRecording]);
 
-  /* ---------- hardware trigger (ESP32 touch button) ----------
+  /* ---------- hardware trigger (ESP32 push-to-talk button) ----------
    * Listens on a Supabase Realtime channel scoped to this user. The
-   * `trigger-mic` Edge Function broadcasts on this same channel name when
-   * the physical button is touched. We just call the SAME startSarvamRecording
-   * used by the on-screen mic button — no separate voice logic.
-   * Ignored while already busy (listening/transcribing/sending) per the
-   * dedup rule in hardware-trigger-architecture.md — a stray or repeated
-   * touch during an active turn does nothing rather than double-triggering.
+   * `trigger-mic` Edge Function broadcasts { action: "start" | "stop" }
+   * on this channel — touch down = start, release = stop. We call the
+   * SAME startSarvamRecording / stopSarvamRecording the on-screen mic
+   * button already uses — no separate voice logic, no new recorder.
+   *
+   * START is ignored if already recording (won't double-start).
+   * STOP is ignored only if NOT currently recording (nothing to stop) —
+   * it is never skipped just because it arrives quickly after START, since
+   * physical release is the authoritative "user is done speaking" signal.
+   * Duplicate broadcasts (same nonce, e.g. a network retry) are dropped.
    */
+  const seenNoncesRef = useRef<Set<string>>(new Set());
+  const listeningRef = useRef(listening);
+  useEffect(() => { listeningRef.current = listening; }, [listening]);
+
   useEffect(() => {
     if (!profile?.id) return;
 
     const channel = supabase.channel(`mic-trigger-${profile.id}`);
     channel
-      .on("broadcast", { event: "start_mic" }, () => {
-        if (listening || transcribing || sending) return;
-        startSarvamRecording();
+      .on("broadcast", { event: "mic_control" }, ({ payload }) => {
+        const { action, nonce } = payload ?? {};
+        if (nonce) {
+          if (seenNoncesRef.current.has(nonce)) return;
+          seenNoncesRef.current.add(nonce);
+          if (seenNoncesRef.current.size > 50) {
+            seenNoncesRef.current = new Set([...seenNoncesRef.current].slice(-25));
+          }
+        }
+
+        if (action === "start") {
+          if (listeningRef.current) return; // already recording — no double-start
+          startSarvamRecording();
+        } else if (action === "stop") {
+          if (!listeningRef.current) return; // nothing to stop
+          stopSarvamRecording();
+        }
       })
-      .subscribe();
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          // Realtime client auto-retries the underlying socket; re-issuing
+          // subscribe() here handles the case where this specific channel
+          // join needs to be re-established after a drop.
+          channel.subscribe();
+        }
+      });
 
     return () => { supabase.removeChannel(channel); };
-  }, [profile?.id, listening, transcribing, sending, startSarvamRecording]);
+  }, [profile?.id, startSarvamRecording, stopSarvamRecording]);
 
   function speakWithBrowser(text: string) {
     if (!("speechSynthesis" in window)) return;

@@ -1,17 +1,18 @@
 // =====================================================================
 // Edge Function: trigger-mic
-// Lets a hardware device (ESP32 button) remotely start the microphone
-// on an already-open browser tab, via Supabase Realtime Broadcast.
+// Lets a hardware push-to-talk button (ESP32 touch sensor) remotely
+// start/stop the microphone on an already-open browser tab, via
+// Supabase Realtime Broadcast.
 //
-// This does NOT do speech-to-text itself — it just pings the browser,
-// which then runs its own existing Sarvam STT flow exactly as if the
-// user had clicked the mic button by hand.
+// This does NOT do speech-to-text itself — it just tells the browser
+// "start" or "stop", which then runs its own existing Sarvam STT flow
+// exactly as if the user had clicked the mic button by hand.
 //
 // Deploy:  supabase functions deploy trigger-mic --project-ref <ref>
 // Secrets: supabase secrets set DEVICE_API_KEY=...
 //
-// Request:  POST { device_key: string }
-// Response: { ok: true } | { error }
+// Request:  POST { device_key: string, action: "start" | "stop" }
+// Response: { ok: true, action } | { error }
 //
 // Auth model: a microcontroller can't do OAuth/JWT, so this uses a single
 // shared device key instead of a user login — deliberately NOT the user's
@@ -42,9 +43,12 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   try {
-    const { device_key } = await req.json().catch(() => ({}));
+    const { device_key, action } = await req.json().catch(() => ({}));
     if (!device_key || device_key !== DEVICE_API_KEY) {
       return json({ error: "Invalid device key" }, 401);
+    }
+    if (action !== "start" && action !== "stop") {
+      return json({ error: '`action` must be "start" or "stop"' }, 400);
     }
 
     const client = createClient(SUPABASE_URL, SERVICE_ROLE, {
@@ -69,12 +73,17 @@ Deno.serve(async (req) => {
 
     await channel.send({
       type: "broadcast",
-      event: "start_mic",
-      payload: { source: "esp32-button", at: new Date().toISOString() },
+      event: "mic_control",
+      payload: {
+        action,
+        nonce: crypto.randomUUID(),
+        ts: new Date().toISOString(),
+        source: "esp32-button",
+      },
     });
     await client.removeChannel(channel);
 
-    return json({ ok: true });
+    return json({ ok: true, action });
   } catch (err) {
     console.error(err);
     return json({ error: "Internal error", detail: String(err).slice(0, 300) }, 500);
