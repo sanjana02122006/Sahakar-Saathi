@@ -598,11 +598,34 @@ void finalizeRecording() {
 // the WAV file itself is never loaded into RAM, consistent with every
 // prior version of this firmware.
 
-// Raw bytes read from LittleFS per chunk, before base64 encoding. Chosen
-// well under the ~5.6KB point where the very first (raw-socket) failure
-// was observed, with margin — base64 inflates this to ~5.5KB, plus a few
-// hundred bytes of JSON/session-id overhead, still a small single POST.
-#define UPLOAD_CHUNK_BYTES 4096
+// Raw bytes read from LittleFS per chunk, before base64 encoding.
+//
+// Real-hardware result at 4096 (base64 ~5.5KB body): `start` (a ~110-byte
+// body) always succeeds; the FIRST `chunk` call always fails client-side
+// with HTTPClient error -11 (HTTPC_ERROR_READ_TIMEOUT — confirmed against
+// the real HTTPClient.cpp source: the client believes its write finished
+// and is waiting for a response that never comes). Server-side logs and
+// the session row's received_bytes=0 confirm the request never actually
+// reached voice-upload's handler — this is not a slow backend (a
+// byte-identical 4096-byte chunk sent via curl round-trips in under 1s
+// with the server doing ~50ms of DB work). The only structural
+// difference between the always-working `start` and the always-failing
+// `chunk` is body size (~110B vs ~5.5KB), which is the same dose-
+// dependent signature as the original confirmed defect in this core's
+// TLS write path (send_ssl_data not correctly looping on partial
+// mbedtls_ssl_write() returns — see the FINAL root-cause comment above
+// uploadRecording()), just now surfacing as a silently-lost request
+// instead of an outright write error. Shrinking the chunk size is a
+// firmware constant change only — no protocol/architecture change —
+// and moves every single chunk request's body far below any size this
+// defect has ever been observed to trigger at (first-ever failure was at
+// 5632 bytes cumulative in one write). 1024 raw bytes -> ~1.4KB base64
+// body, 4x smaller than the failing 4096-byte size — chosen over an even
+// smaller size to limit the total number of chunk round trips (each
+// opens a brand-new TLS connection, per postJson()'s design) for a
+// ~130KB recording to roughly 128 rather than 256+, keeping total
+// upload time reasonable for a live demo.
+#define UPLOAD_CHUNK_BYTES 1024
 
 static const char *B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
