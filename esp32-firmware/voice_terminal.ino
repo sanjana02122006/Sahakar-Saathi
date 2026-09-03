@@ -25,7 +25,12 @@
      -> voice-upload (device_key + WAV) -> transcript (server-side,
         broadcast to the browser over Realtime — this firmware does not
         see the transcript) -> POLLING voice-fetch for the TTS reply
-     -> PLAYING (streamed from LittleFS through I2S TX) -> IDLE
+     -> PLAYING: response WAV downloaded to LittleFS, its RIFF/fmt/data
+        header parsed at runtime (see parseWavHeader) rather than
+        assuming a fixed format, then streamed PCM->I2S TX -> IDLE.
+        No MP3 decoder — the backend's speak() now requests Sarvam's
+        "wav"/PCM codec instead of MP3, so the bytes voice-fetch returns
+        are already playable PCM once past the WAV header.
 
    A new touch while BUSY (anything other than IDLE) is ignored — see
    the state machine below. This is deliberate: half-duplex push-to-talk
@@ -85,7 +90,7 @@ static const char *UPLOAD_LANG = "en-IN";
 #define NUM_CHANNELS     1      // mono
 
 static const char *RECORDING_PATH = "/recording.wav";
-static const char *RESPONSE_PATH  = "/response.mp3";
+static const char *RESPONSE_PATH  = "/response.wav";
 
 // Safety cap so a stuck touch can't fill the filesystem — 30s at
 // 16kHz/16-bit/mono is ~960KB, comfortably inside typical LittleFS
@@ -153,7 +158,7 @@ void handleSetupRoot();
 void handleSetupSave();
 
 void i2sConfigureRx();
-void i2sConfigureTx();
+void i2sConfigureTx(uint32_t sampleRate, uint16_t bitsPerSample, uint16_t numChannels);
 void i2sTeardown();
 
 void onTouchDown(unsigned long now);
@@ -168,7 +173,10 @@ void patchWavHeader(File &f, uint32_t dataBytes);
 
 bool uploadRecording();
 bool pollAndPlayResponse();
-void playMp3File(const String &path);
+
+struct WavInfo; // full definition below, near parseWavHeader/playWavFile
+bool parseWavHeader(File &f, WavInfo &info);
+bool playWavFile(const String &path);
 
 // ============================================================
 // setup / loop
@@ -351,12 +359,27 @@ void i2sConfigureRx() {
 // I2S: TX (amplifier) configuration
 // ============================================================
 
-void i2sConfigureTx() {
+// Sample rate, channel count and bit depth are runtime parameters, not
+// compile-time constants — per the deadline requirement, this firmware
+// does not assume the TTS output format; it parses the actual WAV
+// header (see parseWavHeader() below) and configures I2S TX from
+// whatever that header actually says, whether or not it matches the
+// 16kHz/16-bit/mono that speak() currently requests.
+void i2sConfigureTx(uint32_t sampleRate, uint16_t bitsPerSample, uint16_t numChannels) {
+  i2s_bits_per_sample_t bits =
+      (bitsPerSample == 8) ? I2S_BITS_PER_SAMPLE_8BIT :
+      (bitsPerSample == 24) ? I2S_BITS_PER_SAMPLE_24BIT :
+      (bitsPerSample == 32) ? I2S_BITS_PER_SAMPLE_32BIT :
+      I2S_BITS_PER_SAMPLE_16BIT; // default/most common case, matches speak()'s current output
+
+  i2s_channel_fmt_t channelFmt =
+      (numChannels >= 2) ? I2S_CHANNEL_FMT_RIGHT_LEFT : I2S_CHANNEL_FMT_ONLY_LEFT;
+
   i2s_config_t cfg = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-      .sample_rate = SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+      .sample_rate = sampleRate,
+      .bits_per_sample = bits,
+      .channel_format = channelFmt,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
       .dma_buf_count = 4,
@@ -640,8 +663,9 @@ bool pollAndPlayResponse() {
       http.end();
 
       Serial.printf("Downloaded %d bytes to %s\n", written, RESPONSE_PATH);
-      playMp3File(RESPONSE_PATH);
-      return true;
+      bool played = playWavFile(RESPONSE_PATH);
+      if (!played) Serial.println("PLAYBACK_ERROR: WAV parse/playback failed.");
+      return played;
     }
 
     // Any other status — treat as a transient error and keep polling
@@ -656,55 +680,171 @@ bool pollAndPlayResponse() {
   return false;
 }
 
-void playMp3File(const String &path) {
-  // IMPORTANT LIMITATION, stated plainly rather than glossed over:
-  // MAX98357A is a PCM I2S DAC/amp — it does not decode MP3 on its own.
-  // Playing the MP3 bytes voice-fetch returns requires an MP3 decoder
-  // running on the ESP32 (e.g. the Arduino ESP32-audioI2S / ESP8266Audio
-  // library family, which several ESP32 I2S+MAX98357A projects use) that
-  // decodes MP3 frames into PCM and feeds them to i2s_write() below. That
-  // decoder library is NOT included in this sketch — it depends on which
-  // library the rest of this firmware already uses/prefers, which was
-  // not specified, and pulling in a new audio-decoding dependency
-  // correctly is exactly the kind of thing that should be a deliberate
-  // choice, not a guess baked into a generated file.
-  //
-  // What IS implemented and correct below: the I2S TX configuration and
-  // teardown sequencing, and the file-streaming pattern any decoder would
-  // plug into (read PCM frames from decoder output, i2s_write() them out
-  // in chunks, matching the same non-buffer-the-whole-thing approach used
-  // for recording). If Sarvam's speak() were instead asked for a PCM/WAV
-  // output instead of MP3 (output_audio_codec in supabase/functions/
-  // speak/index.ts is currently hardcoded to "mp3" — see PART 8's own
-  // note that speak() itself was deliberately NOT modified this pass),
-  // this function could i2s_write() the downloaded bytes directly with
-  // no decoder at all, which is the simplest fix if changing that one
-  // line is acceptable.
+// ============================================================
+// WAV parsing (small, hand-rolled — no audio library)
+// ============================================================
+//
+// Backend context: as of this project's MP3->WAV switch, speak() (see
+// supabase/functions/speak/index.ts) requests Sarvam's "wav" codec at
+// speech_sample_rate=16000, which a live test against the deployed
+// function confirmed produces a standard PCM WAV: RIFF/WAVE, mono,
+// 16000Hz, 16-bit. That confirmed value is NOT hardcoded here, though —
+// Sarvam does not echo the sample rate back in any response field this
+// project's code inspects, and the point of parsing the header at all is
+// to not assume it holds. If speak() is ever retuned to a different
+// rate/channel count, this parser adapts without a firmware change.
 
-  Serial.println("PLAYING (stub — see comment above: MP3 decoding not implemented in this sketch)");
+struct WavInfo {
+  uint16_t audioFormat;
+  uint16_t numChannels;
+  uint32_t sampleRate;
+  uint16_t bitsPerSample;
+  uint32_t dataSize;
+  uint32_t dataOffset; // byte offset into the file where PCM samples begin
+};
 
+static uint16_t readLE16(File &f) {
+  uint8_t b[2];
+  f.read(b, 2);
+  return (uint16_t)(b[0] | (b[1] << 8));
+}
+
+static uint32_t readLE32(File &f) {
+  uint8_t b[4];
+  f.read(b, 4);
+  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+// Parses a standard RIFF/WAVE/PCM header. Walks chunks generically after
+// "WAVE" so a "fmt " chunk that isn't immediately followed by "data"
+// (e.g. a LIST/INFO chunk in between, which some encoders emit) is
+// skipped correctly rather than assumed away. Returns false and logs a
+// reason on any structural or format problem.
+bool parseWavHeader(File &f, WavInfo &info) {
+  char tag[5] = {0};
+
+  f.seek(0);
+  f.read((uint8_t *)tag, 4);
+  if (memcmp(tag, "RIFF", 4) != 0) {
+    Serial.println("WAV parse error: missing RIFF header.");
+    return false;
+  }
+  readLE32(f); // overall RIFF chunk size — not needed, dataSize below is authoritative
+
+  f.read((uint8_t *)tag, 4);
+  if (memcmp(tag, "WAVE", 4) != 0) {
+    Serial.println("WAV parse error: missing WAVE marker.");
+    return false;
+  }
+
+  bool haveFmt = false;
+  bool haveData = false;
+
+  // Walk chunks until both fmt and data are found or EOF.
+  while (f.available() >= 8) {
+    f.read((uint8_t *)tag, 4);
+    uint32_t chunkSize = readLE32(f);
+    uint32_t chunkBodyStart = f.position();
+
+    if (memcmp(tag, "fmt ", 4) == 0) {
+      info.audioFormat = readLE16(f);
+      info.numChannels = readLE16(f);
+      info.sampleRate = readLE32(f);
+      readLE32(f); // byte rate — derivable, not needed directly
+      readLE16(f); // block align — derivable, not needed directly
+      info.bitsPerSample = readLE16(f);
+      haveFmt = true;
+    } else if (memcmp(tag, "data", 4) == 0) {
+      info.dataSize = chunkSize;
+      info.dataOffset = chunkBodyStart;
+      haveData = true;
+      // Do not seek past the data chunk — its body is exactly what the
+      // caller streams next; stopping the chunk walk here is correct
+      // and avoids scanning potentially large PCM payload as if it were
+      // more chunk headers.
+      break;
+    }
+
+    if (!haveData) {
+      // Skip this chunk's body (covers LIST/INFO/fact/etc. between fmt
+      // and data — required by the task, not just fmt itself). RIFF
+      // chunks are word-aligned: pad one byte if chunkSize is odd.
+      uint32_t skip = chunkSize + (chunkSize % 2);
+      f.seek(chunkBodyStart + skip);
+    }
+  }
+
+  if (!haveFmt || !haveData) {
+    Serial.println("WAV parse error: missing fmt or data chunk.");
+    return false;
+  }
+  if (info.audioFormat != 1) {
+    Serial.printf("WAV parse error: unsupported audioFormat=%u (only PCM=1 is supported).\n", info.audioFormat);
+    return false;
+  }
+  if (info.bitsPerSample != 8 && info.bitsPerSample != 16 && info.bitsPerSample != 24 && info.bitsPerSample != 32) {
+    Serial.printf("WAV parse error: unsupported bitsPerSample=%u.\n", info.bitsPerSample);
+    return false;
+  }
+
+  Serial.println("WAV:");
+  Serial.printf("  channels=%u\n", info.numChannels);
+  Serial.printf("  sampleRate=%u\n", info.sampleRate);
+  Serial.printf("  bits=%u\n", info.bitsPerSample);
+  Serial.printf("  dataSize=%u\n", info.dataSize);
+  return true;
+}
+
+// Streams PCM from LittleFS to I2S TX in small chunks — never loads the
+// whole file into RAM, matching the same approach used for recording.
+//
+// Stereo handling: i2sConfigureTx() above already configures the I2S
+// peripheral's channel format to match the header (RIGHT_LEFT for
+// stereo, ONLY_LEFT for mono), so interleaved stereo PCM bytes can be
+// written straight through with no downmix — this is the "simpler
+// reliable option" the task asks to prefer over downmixing. speak()'s
+// actual output as deployed is mono (confirmed by a live test against
+// the running backend), so this branch is expected to be exercised
+// rarely if ever, but is handled correctly rather than assumed away.
+bool playWavFile(const String &path) {
   File f = LittleFS.open(path, FILE_READ);
   if (!f) {
     Serial.println("PLAYBACK_ERROR: could not open response file.");
-    return;
+    return false;
   }
 
-  i2sConfigureTx();
+  WavInfo info;
+  if (!parseWavHeader(f, info)) {
+    f.close();
+    return false;
+  }
 
-  // Placeholder playback loop: writes the RAW MP3 bytes to I2S, which
-  // will NOT sound correct (MP3 is compressed, not PCM) — this proves
-  // the I2S TX path, DMA buffering, and RX/TX teardown sequencing are
-  // wired correctly, but real audio requires the decoder noted above.
-  uint8_t buf[512];
+  if (info.numChannels >= 2) {
+    Serial.println("Note: stereo WAV — playing as interleaved stereo via I2S_CHANNEL_FMT_RIGHT_LEFT, no downmix needed.");
+  }
+
+  f.seek(info.dataOffset);
+  i2sConfigureTx(info.sampleRate, info.bitsPerSample, info.numChannels);
+
+  Serial.println("PLAY START");
+
+  const size_t CHUNK = 512;
+  uint8_t buf[CHUNK];
+  uint32_t remaining = info.dataSize;
   size_t bytesWritten;
-  while (f.available()) {
-    size_t n = f.read(buf, sizeof(buf));
-    i2s_write(I2S_NUM_0, buf, n, &bytesWritten, 100 / portTICK_PERIOD_MS);
-  }
-  f.close();
 
+  while (remaining > 0) {
+    size_t toRead = min((uint32_t)CHUNK, remaining);
+    size_t n = f.read(buf, toRead);
+    if (n == 0) break;
+    i2s_write(I2S_NUM_0, buf, n, &bytesWritten, 100 / portTICK_PERIOD_MS);
+    remaining -= n;
+  }
+
+  f.close();
   i2sTeardown();
-  Serial.println("Playback stream finished.");
+  Serial.println("PLAY END");
+  return true;
 }
 
 // ============================================================

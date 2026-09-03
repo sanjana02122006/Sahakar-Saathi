@@ -2,16 +2,20 @@
 // Edge Function: voice-fetch
 // Polled by the ESP32 after a successful voice-upload. Returns the
 // newest unconsumed TTS clip queued for this device's target user (see
-// voice-output), as raw MP3 bytes — never base64, the ESP32 has no
+// voice-output), as raw audio bytes — never base64, the ESP32 has no
 // reason to pay that encoding overhead over its own network hop.
 //
 // Deploy:  supabase functions deploy voice-fetch --project-ref <ref>
 // Secrets: supabase secrets set DEVICE_API_KEY=...  (already set)
 //
 // Request:  GET /functions/v1/voice-fetch?device_key=<DEVICE_API_KEY>
-// Response: 204 No Content                      — nothing queued
-//           200, Content-Type: audio/mpeg, body — raw MP3 bytes
-//           401 { error }                        — bad/missing device key
+// Response: 204 No Content                     — nothing queued
+//           200, Content-Type: audio/wav, body — raw WAV/PCM bytes
+//           401 { error }                       — bad/missing device key
+//
+// Content-Type is read straight from the queue row's stored `mime`
+// (set by voice-output from whatever speak() produced) — this function
+// needed NO logic change for the MP3->WAV switch, only this comment.
 //
 // Marks the row consumed_at = now() as part of the SAME request that
 // serves it, using a single UPDATE ... WHERE consumed_at IS NULL guard —
@@ -95,7 +99,7 @@ Deno.serve(async (req) => {
     const bytes = new Uint8Array(await fileData.arrayBuffer());
     return new Response(bytes, {
       status: 200,
-      headers: { ...CORS, "Content-Type": pending.mime || "audio/mpeg", "Content-Length": String(bytes.length) },
+      headers: { ...CORS, "Content-Type": pending.mime || "audio/wav", "Content-Length": String(bytes.length) },
     });
   } catch (err) {
     console.error(err);

@@ -2,10 +2,13 @@
 // Edge Function: voice-output
 // Called by the browser (authenticated, existing Supabase session —
 // NOT the device key) right after speak() gets a TTS clip back from
-// Sarvam. Mirrors that same audio into private Storage + a queue row so
-// the ESP32 terminal can retrieve it later via voice-fetch. Does NOT
-// replace or delay the browser's own playback — speak() keeps playing
-// the clip locally exactly as before; this is purely a side channel.
+// Sarvam (WAV/PCM as of this project's ESP32 integration — see
+// speak/index.ts). Mirrors that same audio into private Storage + a
+// queue row so the ESP32 terminal can retrieve it later via voice-fetch.
+// Does NOT replace or delay the browser's own playback — speak() keeps
+// playing the clip locally exactly as before; this is purely a side
+// channel. Format-agnostic: stores whatever `mime` it's given, so this
+// function itself needed no logic change for the MP3->WAV switch.
 //
 // Deploy:  supabase functions deploy voice-output --project-ref <ref>
 // Secrets: none beyond what's already set (SUPABASE_SERVICE_ROLE_KEY,
@@ -65,11 +68,15 @@ Deno.serve(async (req) => {
     if (typeof audio !== "string" || !audio) {
       return json({ error: "`audio` (base64) is required" }, 400);
     }
-    const contentType = typeof mime === "string" && mime ? mime : "audio/mpeg";
+    // Default matches speak()'s current output (audio/wav) rather than
+    // the old MP3-era default — this only matters if mime is omitted,
+    // which the browser's actual call site never does today.
+    const contentType = typeof mime === "string" && mime ? mime : "audio/wav";
+    const ext = contentType === "audio/wav" ? "wav" : contentType === "audio/mpeg" ? "mp3" : "bin";
 
     // ---------- decode + upload to private Storage ----------
     const bytes = base64ToBytes(audio);
-    const objectPath = `${userId}/${crypto.randomUUID()}.mp3`;
+    const objectPath = `${userId}/${crypto.randomUUID()}.${ext}`;
 
     const { error: uploadErr } = await admin.storage
       .from("device-audio")

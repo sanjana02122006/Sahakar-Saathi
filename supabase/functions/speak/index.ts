@@ -9,6 +9,18 @@
 //
 // Request:  { text: string, lang: string }             (lang like "hi-IN")
 // Response: { audio: string, mime: "audio/wav" } | { error, unsupported?: boolean }
+//
+// Codec is WAV/PCM (not MP3): verified against Sarvam's own API docs that
+// "wav" is a valid output_audio_codec and the response shape is unchanged
+// (still base64 in the `audios` array) regardless of codec — so this is
+// a one-parameter change, not a response-format change. Chosen so the
+// ESP32 terminal (supabase/functions/voice-fetch + esp32-firmware/
+// voice_terminal.ino) can play the clip directly via I2S with no MP3
+// decoder, per this project's deadline constraint. Sample rate is
+// pinned to 16000Hz — matching the rate this project's INMP441 recording
+// path already uses elsewhere — via speech_sample_rate; Sarvam does not
+// echo the sample rate back in the response, so the ESP32 firmware
+// parses the actual WAV header rather than assume this value held.
 // =====================================================================
 
 const SARVAM_API_KEY = Deno.env.get("SARVAM_API_KEY");
@@ -58,7 +70,8 @@ Deno.serve(async (req) => {
         target_language_code: lang,
         speaker,
         model: "bulbul:v3",
-        output_audio_codec: "mp3",
+        output_audio_codec: "wav",
+        speech_sample_rate: 16000,
         pace: 1.0,
       }),
     });
@@ -73,7 +86,7 @@ Deno.serve(async (req) => {
     const audio = data.audios?.[0];
     if (!audio) return json({ error: "No audio returned", unsupported: true }, 502);
 
-    return json({ audio, mime: "audio/mpeg" });
+    return json({ audio, mime: "audio/wav" });
   } catch (err) {
     console.error(err);
     return json({ error: "Internal error", detail: String(err).slice(0, 300) }, 500);
