@@ -203,6 +203,15 @@ void setup() {
 
   pinMode(PIN_TOUCH, INPUT);
 
+  // Same reasoning as the pinMode/digitalWrite added to i2sTeardown():
+  // before the very first i2sConfigureTx()/i2sConfigureRx() call, this
+  // pin has never been claimed by anything and floats at whatever level
+  // noise leaves it at -- drive it low here too so the amp's input is
+  // defined from the moment the board boots, not just after the first
+  // playback cycle.
+  pinMode(PIN_I2S_SD_OUT, OUTPUT);
+  digitalWrite(PIN_I2S_SD_OUT, LOW);
+
   if (!LittleFS.begin(true)) {
     Serial.println("FATAL: LittleFS mount failed even after format — halting.");
     while (true) delay(1000);
@@ -449,6 +458,23 @@ void i2sConfigureTx(uint32_t sampleRate, uint16_t bitsPerSample, uint16_t numCha
 
 void i2sTeardown() {
   i2s_driver_uninstall(I2S_NUM_0);
+
+  // i2s_driver_uninstall() releases the I2S peripheral's control of its
+  // pins -- including PIN_I2S_SD_OUT (GPIO7, the MAX98357A's DIN), which
+  // is left floating until the next i2sConfigureTx() call. The very next
+  // I2S activity is usually i2sConfigureRx() for a new recording (it sets
+  // data_out_num = I2S_PIN_NO_CHANGE, so it never touches this pin at
+  // all), which re-clocks BCLK/WS (shared between mic and amp) while the
+  // amp's DIN is still floating -- the amp is still physically wired to
+  // those same clock lines and amplifies whatever noise is present on its
+  // floating input the instant it sees valid clocking again. This is
+  // exactly the click/pop heard right at touch-down (the moment
+  // beginRecording() -> i2sConfigureRx() runs next). Explicitly driving
+  // this pin LOW (silence) as a plain GPIO immediately after every
+  // teardown keeps the amp's input defined and silent whenever I2S isn't
+  // actively driving it for real playback.
+  pinMode(PIN_I2S_SD_OUT, OUTPUT);
+  digitalWrite(PIN_I2S_SD_OUT, LOW);
 }
 
 // ============================================================
@@ -874,6 +900,7 @@ bool pollAndPlayResponse() {
 
     if (code == 200) {
       Serial.println("[POLL] Response received");
+      WiFiClient *stream = http.getStreamPtr();
       int len = http.getSize(); // Content-Length; -1 if the server didn't send one
 
       // ---- FIX 1: always start from a clean slate ----
@@ -912,39 +939,47 @@ bool pollAndPlayResponse() {
         return false;
       }
 
-      // ---- FIX 3: use HTTPClient's OWN writeToStream(), not a manual
-      // raw-stream copy ----
-      // voice-fetch responds with Transfer-Encoding: chunked (confirmed
-      // via curl -v against the live server -- it never sends
-      // Content-Length, which is exactly why `len` above is -1). A manual
-      // loop reading directly from http.getStreamPtr() -- what this used
-      // to do -- reads the RAW wire bytes: the hex chunk-size lines and
-      // their \r\n framing get written into response.wav right alongside
-      // the real audio bytes, since HTTPClient's chunked-transfer decoder
-      // lives inside writeToStream()/writeToStreamDataBlock(), not on the
-      // raw Stream* getStreamPtr() returns. This matches exactly what was
-      // observed on real hardware: the start of the clip missing or
-      // garbled, and playback stopping partway through a 10-line reply --
-      // the chunk framing corrupts the WAV's own byte alignment, and
-      // parseWavHeader()/the I2S write loop then either skip real audio,
-      // read chunk-size text as if it were PCM samples, or hit an
-      // unexpected byte pattern that looks like "no more data" partway
-      // through what should still be audio.
-      //
-      // File IS a Stream (the Arduino core's LittleFS File class extends
-      // Stream), so http.writeToStream(&out) can write directly into it
-      // using HTTPClient's own already-correct chunked decode loop
-      // instead of reimplementing it by hand. Returns the number of bytes
-      // actually written on success, or a negative HTTPClient error code.
-      int written = http.writeToStream(&out);
+      // ---- FIX 3: track expected/received/written bytes, verify every write ----
+      uint8_t buf[512];
+      uint32_t received = 0;   // bytes read from the network
+      uint32_t writtenOk = 0;  // bytes CONFIRMED written to LittleFS (write() return value, not just requested)
+      bool writeFailed = false;
+      unsigned long dlStart = millis();
+
+      while (http.connected() && (len < 0 || (int)received < len)) {
+        size_t avail = stream->available();
+        if (avail) {
+          int n = stream->readBytes(buf, min((size_t)sizeof(buf), avail));
+          received += n;
+
+          size_t w = out.write(buf, n);
+          if (w != (size_t)n) {
+            // Do NOT assume out.write(buf, n) wrote all n bytes — per the
+            // requirement, check the actual return value every time.
+            Serial.printf("[PLAYBACK_ERROR] LittleFS write failed (requested %d, wrote %u)\n", n, (unsigned)w);
+            writeFailed = true;
+            break;
+          }
+          writtenOk += w;
+          dlStart = millis(); // reset stall timer on real progress
+        } else if ((millis() - dlStart) > 30000) {
+          Serial.println("[PLAYBACK_ERROR] download stalled, aborting.");
+          writeFailed = true;
+          break;
+        }
+        delay(1);
+      }
       out.close();
       http.end();
 
-      bool writeFailed = (written < 0);
-      uint32_t writtenOk = writeFailed ? 0 : (uint32_t)written;
+      // A short read (connection closed before `len` bytes arrived) is the
+      // same class of problem as a failed write: an incomplete file must
+      // not be handed to the WAV parser/playback path.
+      bool shortRead = (len > 0 && (int)received < len);
 
-      if (writeFailed) {
-        Serial.printf("[PLAYBACK_ERROR] writeToStream failed: %s (code %d)\n", http.errorToString(written).c_str(), written);
+      if (writeFailed || shortRead) {
+        Serial.printf("[PLAYBACK_ERROR] Response WAV incomplete (expected=%d received=%u written=%u)\n",
+                      len, received, writtenOk);
         Serial.println("[PLAYBACK_ERROR] Response WAV discarded");
         if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
         return false;
@@ -1266,8 +1301,6 @@ void handleSetupRoot() {
       "<label>Quick option</label>"
       "<select id='quick' onchange='document.getElementById(\"ssid\").value=this.value.startsWith(\"__\")?\"\":this.value'>"
       "<option value='__custom'>Custom network</option>"
-      "<option value='MARINE EDGE'>MARINE EDGE</option>"
-      "<option value='MARINE_EDGE'>MARINE_EDGE</option>"
       "</select>"
       "<label>SSID</label>"
       "<input type='text' id='ssid' name='ssid' placeholder='Network name' required>"
