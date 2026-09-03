@@ -16,3 +16,15 @@ verify_jwt = true
 # ESP32 cannot produce a Supabase user JWT — auth is instead the
 # device_key check inside the function itself (see index.ts).
 verify_jwt = false
+
+[functions.voice-upload]
+# Same reasoning as trigger-mic — ESP32 posts a device_key, not a JWT.
+verify_jwt = false
+
+[functions.voice-fetch]
+# Same reasoning as trigger-mic — ESP32 polls with a device_key, not a JWT.
+verify_jwt = false
+
+[functions.voice-output]
+# Called by the browser with a real Supabase session — same as chat.
+verify_jwt = true

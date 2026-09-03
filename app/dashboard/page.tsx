@@ -180,22 +180,36 @@ export default function DashboardPage() {
     startSarvamRecording(false); // manual click — leave transcript in composer to review/edit
   }, [listening, startSarvamRecording, stopSarvamRecording]);
 
-  /* ---------- hardware trigger (ESP32 push-to-talk button) ----------
-   * Listens on a Supabase Realtime channel scoped to this user. The
-   * `trigger-mic` Edge Function broadcasts { action: "start" | "stop" }
-   * on this channel — touch down = start, release = stop. We call the
-   * SAME startSarvamRecording / stopSarvamRecording the on-screen mic
-   * button already uses — no separate voice logic, no new recorder.
+  /* ---------- hardware channel (ESP32 push-to-talk terminal) ----------
+   * Listens on a Supabase Realtime channel scoped to this user for TWO
+   * sibling event types, both broadcast by different Edge Functions on
+   * the SAME channel:
    *
-   * START is ignored if already recording (won't double-start).
-   * STOP is ignored only if NOT currently recording (nothing to stop) —
-   * it is never skipped just because it arrives quickly after START, since
-   * physical release is the authoritative "user is done speaking" signal.
-   * Duplicate broadcasts (same nonce, e.g. a network retry) are dropped.
+   *  - "mic_control" (from trigger-mic): { action: "start"|"stop" } —
+   *    the browser-mic path, touch down/up remotely operating THIS
+   *    device's own microphone via startSarvamRecording/stopSarvamRecording.
+   *
+   *  - "voice_transcript" (from voice-upload): { text } — the ESP32's OWN
+   *    INMP441 microphone already recorded, uploaded, and had transcribed
+   *    server-side; there is nothing to record here, just an already-final
+   *    transcript to hand to the existing send() pipeline, unchanged.
+   *
+   * Both share one dedup Set (seenNoncesRef) since nonces are UUIDs and
+   * collisions across event types are not a real concern.
    */
   const seenNoncesRef = useRef<Set<string>>(new Set());
   const listeningRef = useRef(listening);
   useEffect(() => { listeningRef.current = listening; }, [listening]);
+
+  function isDuplicateNonce(nonce: unknown): boolean {
+    if (typeof nonce !== "string" || !nonce) return false;
+    if (seenNoncesRef.current.has(nonce)) return true;
+    seenNoncesRef.current.add(nonce);
+    if (seenNoncesRef.current.size > 50) {
+      seenNoncesRef.current = new Set([...seenNoncesRef.current].slice(-25));
+    }
+    return false;
+  }
 
   useEffect(() => {
     if (!profile?.id) return;
@@ -204,21 +218,30 @@ export default function DashboardPage() {
     channel
       .on("broadcast", { event: "mic_control" }, ({ payload }) => {
         const { action, nonce } = payload ?? {};
-        if (nonce) {
-          if (seenNoncesRef.current.has(nonce)) return;
-          seenNoncesRef.current.add(nonce);
-          if (seenNoncesRef.current.size > 50) {
-            seenNoncesRef.current = new Set([...seenNoncesRef.current].slice(-25));
-          }
-        }
+        if (isDuplicateNonce(nonce)) return;
 
+        // START is ignored if already recording (won't double-start).
+        // STOP is ignored only if NOT currently recording (nothing to
+        // stop) — never skipped just for arriving quickly after START,
+        // since physical release is the authoritative "done speaking" signal.
         if (action === "start") {
-          if (listeningRef.current) return; // already recording — no double-start
+          if (listeningRef.current) return;
           startSarvamRecording(true); // hardware trigger — send as soon as transcription completes
         } else if (action === "stop") {
-          if (!listeningRef.current) return; // nothing to stop
+          if (!listeningRef.current) return;
           stopSarvamRecording();
         }
+      })
+      .on("broadcast", { event: "voice_transcript" }, ({ payload }) => {
+        const { text, nonce } = payload ?? {};
+        if (isDuplicateNonce(nonce)) return;
+        if (typeof text !== "string" || !text.trim()) return; // nothing to send
+
+        // Transcript already final (ESP32's own mic + voice-upload's Sarvam
+        // call produced it) — hand straight to the existing chat pipeline.
+        // Deliberately NOT calling chat or speak directly here: send()
+        // already owns persisting the turn and triggering speak(reply).
+        send(text);
       })
       .subscribe((status) => {
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
@@ -267,8 +290,31 @@ export default function DashboardPage() {
       const audio = new Audio(`data:${data.mime};base64,${data.audio}`);
       audioRef.current = audio;
       audio.play().catch(() => speakWithBrowser(text));
+
+      // Mirror the same clip to the ESP32 terminal's pickup queue.
+      // Fire-and-forget: browser playback above has already started and
+      // must never wait on, or fail because of, this — a hardware
+      // terminal that's offline, slow, or not yet polling should have
+      // zero effect on the normal website experience.
+      mirrorAudioToDevice(data.audio, data.mime);
     } catch {
       speakWithBrowser(text);
+    }
+  }
+
+  async function mirrorAudioToDevice(audioBase64: string, mime: string) {
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) return;
+
+      await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/voice-output`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ audio: audioBase64, mime }),
+      });
+    } catch {
+      // Non-fatal by design — see call site comment. The ESP32 simply
+      // won't have this clip queued; nothing else in the app is affected.
     }
   }
 
