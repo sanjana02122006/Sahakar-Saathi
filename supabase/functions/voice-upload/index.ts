@@ -209,7 +209,15 @@ Deno.serve(async (req) => {
   try {
     // ================= Shape (B): chunked JSON session protocol =================
     if (contentType.includes("application/json")) {
-      const body = await req.json().catch(() => ({}));
+      // Logged BEFORE the body is read, deliberately — if req.json() is
+      // itself what hangs (e.g. Content-Length doesn't match the bytes
+      // actually delivered by the client, so the runtime keeps waiting
+      // for more), this line still fires while the later per-step CHUNK
+      // logs below would not, which is exactly the signal needed to tell
+      // "hung reading the body" apart from "hung after parsing it".
+      console.log(`[UPLOAD] request received, content-length=${req.headers.get("content-length") ?? "(none)"}`);
+      const body = await req.json().catch((e) => { console.error("[UPLOAD] body read/parse failed:", e); return {}; });
+      console.log("[UPLOAD] body read complete");
       const action = body?.action;
 
       if (action === "start") {
@@ -249,12 +257,15 @@ Deno.serve(async (req) => {
         // it. device_key_hash is still stored on the session row (set
         // from the authenticated `start` call) for audit/traceability,
         // even though it isn't re-checked as a header on every chunk.
+        console.log("[CHUNK] request received");
+
         if (typeof body.session_id !== "string" || !body.session_id) {
           return json({ error: "`session_id` is required" }, 400);
         }
         if (typeof body.data !== "string" || !body.data) {
           return json({ error: "`data` (base64) is required" }, 400);
         }
+        console.log("[CHUNK] body parsed");
 
         // Only a session that is (a) this exact session_id, (b) still
         // open, and (c) not expired is touched at all.
@@ -271,8 +282,11 @@ Deno.serve(async (req) => {
           return json({ error: "Internal error" }, 500);
         }
         if (!session) return json({ error: "Unknown or expired session_id" }, 404);
+        console.log("[CHUNK] session lookup complete");
 
         const bytes = base64ToBytes(body.data);
+        console.log(`[CHUNK] chunk decoded, byte length=${bytes.length}`);
+
         if (session.received_bytes + bytes.length > MAX_SESSION_BYTES) {
           await admin.from("device_voice_upload_sessions").delete().eq("session_id", session.session_id);
           return json({ error: "Session exceeded max allowed size" }, 413);
@@ -296,6 +310,7 @@ Deno.serve(async (req) => {
         }
         const seq = count ?? 0;
 
+        console.log("[CHUNK] database insert starting");
         const { error: chunkErr } = await admin.from("device_voice_upload_chunks").insert({
           session_id: session.session_id,
           seq,
@@ -305,6 +320,7 @@ Deno.serve(async (req) => {
           console.error("chunk insert failed:", chunkErr);
           return json({ error: "Could not store chunk" }, 500);
         }
+        console.log("[CHUNK] database insert completed");
 
         const receivedBytes = session.received_bytes + bytes.length;
         const { error: updErr } = await admin
@@ -313,6 +329,7 @@ Deno.serve(async (req) => {
           .eq("session_id", session.session_id);
         if (updErr) console.error("received_bytes update failed (non-fatal):", updErr); // chunk itself is already durably stored; a failed counter update just makes progress logging slightly stale, not the upload
 
+        console.log("[CHUNK] response returning");
         return json({ ok: true, received: receivedBytes });
       }
 
