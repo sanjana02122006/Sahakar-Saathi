@@ -724,6 +724,30 @@ bool uploadRecording() {
   }
   Serial.println("[UPLOAD] HTTPClient connected...");
 
+  // ---- Timeout hypothesis, NOT a confirmed fix — flagged as such ----
+  // The rewrite to HTTPClient::sendRequest() (previous commit) still
+  // failed on real hardware: HTTPC_ERROR_SEND_PAYLOAD_FAILED (-3) after
+  // ~15.9s sending a ~170KB body. HTTPClient's own default TCP timeout
+  // is 5000ms (HTTPCLIENT_DEFAULT_TCP_TIMEOUT, confirmed in the real
+  // HTTPClient.h source) — the failure happened well past that default,
+  // which is consistent with (but not proof of) the transfer simply
+  // outliving the timeout on a real WiFi link, rather than a defect in
+  // MultipartUploadStream or in sendRequest's write-retry logic itself
+  // (confirmed by reading HTTPClient.cpp: that loop only returns -3 on
+  // an actual client->write() failure or a final size mismatch, not on
+  // a Stream that transiently returns 0 from available()). Extending
+  // both timeouts is the smallest change that tests this hypothesis
+  // without altering the transport architecture again. setTimeout()/
+  // setConnectTimeout() are used here specifically because both are
+  // confirmed present on HTTPClient itself in the current upstream
+  // source — WiFiClientSecure's own timeout API differs across
+  // arduino-esp32 core versions (it is a typedef over NetworkClient in
+  // newer cores), so calling it directly here would risk targeting the
+  // wrong installed version's method signature.
+  http.setConnectTimeout(15000);
+  http.setTimeout(30000);
+  Serial.println("[UPLOAD] Timeouts: connect=15000ms overall=30000ms (default was 5000ms — likely cause of the -3 failure at 15.9s)");
+
   // Content-Type is set explicitly (sendRequest does not infer this from
   // the boundary); Content-Length is NOT set here — sendRequest(type,
   // stream, size) sets it internally from the size argument below, per
