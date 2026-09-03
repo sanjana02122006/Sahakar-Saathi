@@ -56,7 +56,6 @@
      No WiFi.scanNetworks() — manual SSID entry + two named quick options
      (MARINE EDGE / MARINE_EDGE) + a free-text custom option.
    ===================================================================== */
-
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -875,7 +874,6 @@ bool pollAndPlayResponse() {
 
     if (code == 200) {
       Serial.println("[POLL] Response received");
-      WiFiClient *stream = http.getStreamPtr();
       int len = http.getSize(); // Content-Length; -1 if the server didn't send one
 
       // ---- FIX 1: always start from a clean slate ----
@@ -914,47 +912,39 @@ bool pollAndPlayResponse() {
         return false;
       }
 
-      // ---- FIX 3: track expected/received/written bytes, verify every write ----
-      uint8_t buf[512];
-      uint32_t received = 0;   // bytes read from the network
-      uint32_t writtenOk = 0;  // bytes CONFIRMED written to LittleFS (write() return value, not just requested)
-      bool writeFailed = false;
-      unsigned long dlStart = millis();
-
-      while (http.connected() && (len < 0 || (int)received < len)) {
-        size_t avail = stream->available();
-        if (avail) {
-          int n = stream->readBytes(buf, min((size_t)sizeof(buf), avail));
-          received += n;
-
-          size_t w = out.write(buf, n);
-          if (w != (size_t)n) {
-            // Do NOT assume out.write(buf, n) wrote all n bytes — per the
-            // requirement, check the actual return value every time.
-            Serial.printf("[PLAYBACK_ERROR] LittleFS write failed (requested %d, wrote %u)\n", n, (unsigned)w);
-            writeFailed = true;
-            break;
-          }
-          writtenOk += w;
-          dlStart = millis(); // reset stall timer on real progress
-        } else if ((millis() - dlStart) > 15000) {
-          Serial.println("[PLAYBACK_ERROR] download stalled, aborting.");
-          writeFailed = true;
-          break;
-        }
-        delay(1);
-      }
+      // ---- FIX 3: use HTTPClient's OWN writeToStream(), not a manual
+      // raw-stream copy ----
+      // voice-fetch responds with Transfer-Encoding: chunked (confirmed
+      // via curl -v against the live server -- it never sends
+      // Content-Length, which is exactly why `len` above is -1). A manual
+      // loop reading directly from http.getStreamPtr() -- what this used
+      // to do -- reads the RAW wire bytes: the hex chunk-size lines and
+      // their \r\n framing get written into response.wav right alongside
+      // the real audio bytes, since HTTPClient's chunked-transfer decoder
+      // lives inside writeToStream()/writeToStreamDataBlock(), not on the
+      // raw Stream* getStreamPtr() returns. This matches exactly what was
+      // observed on real hardware: the start of the clip missing or
+      // garbled, and playback stopping partway through a 10-line reply --
+      // the chunk framing corrupts the WAV's own byte alignment, and
+      // parseWavHeader()/the I2S write loop then either skip real audio,
+      // read chunk-size text as if it were PCM samples, or hit an
+      // unexpected byte pattern that looks like "no more data" partway
+      // through what should still be audio.
+      //
+      // File IS a Stream (the Arduino core's LittleFS File class extends
+      // Stream), so http.writeToStream(&out) can write directly into it
+      // using HTTPClient's own already-correct chunked decode loop
+      // instead of reimplementing it by hand. Returns the number of bytes
+      // actually written on success, or a negative HTTPClient error code.
+      int written = http.writeToStream(&out);
       out.close();
       http.end();
 
-      // A short read (connection closed before `len` bytes arrived) is the
-      // same class of problem as a failed write: an incomplete file must
-      // not be handed to the WAV parser/playback path.
-      bool shortRead = (len > 0 && (int)received < len);
+      bool writeFailed = (written < 0);
+      uint32_t writtenOk = writeFailed ? 0 : (uint32_t)written;
 
-      if (writeFailed || shortRead) {
-        Serial.printf("[PLAYBACK_ERROR] Response WAV incomplete (expected=%d received=%u written=%u)\n",
-                      len, received, writtenOk);
+      if (writeFailed) {
+        Serial.printf("[PLAYBACK_ERROR] writeToStream failed: %s (code %d)\n", http.errorToString(written).c_str(), written);
         Serial.println("[PLAYBACK_ERROR] Response WAV discarded");
         if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
         return false;
@@ -1200,38 +1190,18 @@ bool playWavFile(const String &path) {
   // by the time it returns, not that they've actually finished playing
   // out through the amp/speaker yet -- calling i2sTeardown() (which
   // uninstalls the I2S driver) immediately after the last write was
-  // cutting the tail of every clip off. A first attempt at fixing this
-  // with a bare delay() sized to the DMA buffer's own nominal depth
-  // (dma_buf_count=4 * dma_buf_len=256 samples) was NOT enough margin on
-  // real hardware -- the tail was still getting clipped. Rather than
-  // guess at a larger fixed number again, this now explicitly writes a
-  // burst of silence (zero) samples through i2s_write() itself after the
-  // real audio, instead of only delay()ing blind: i2s_write() naturally
-  // blocks/paces against the DMA queue's real fill state when the queue
-  // is full, which is a hardware-timed guarantee a bare delay() estimate
-  // is not. By the time these zero-samples have themselves been written
-  // out, every real audio sample queued before them is guaranteed to have
-  // already played (I2S/DMA delivers samples in FIFO order) -- so this is
-  // correct regardless of exactly how much headroom the DMA buffers have,
-  // not dependent on getting a timing estimate right. ~200ms of silence
-  // at whatever the actual output format's bytes-per-sample is.
-  {
-    uint16_t bytesPerSample = (info.bitsPerSample / 8) * (info.numChannels >= 2 ? 2 : 1);
-    uint32_t silenceBytes = (info.sampleRate * bytesPerSample * 200) / 1000; // 200ms of silence
-    static uint8_t silenceBuf[512] = {0}; // already all-zero; no need to memset every call
-    uint32_t silenceRemaining = silenceBytes;
-    while (silenceRemaining > 0) {
-      size_t n = min((uint32_t)sizeof(silenceBuf), silenceRemaining);
-      i2s_write(I2S_NUM_0, silenceBuf, n, &bytesWritten, 100 / portTICK_PERIOD_MS);
-      silenceRemaining -= n;
-    }
-  }
-
-  // Small additional fixed margin on top of the silence write above --
-  // cheap insurance against any remaining scheduling jitter between the
-  // last i2s_write() call returning and the DMA hardware actually having
-  // drained that final buffer.
-  delay(50);
+  // cutting the tail of every clip off, exactly matching "it got cut
+  // short". The TX config above sets dma_buf_count=4 * dma_buf_len=256 =
+  // 1024 samples of buffering headroom; at this WAV's own sample rate
+  // that's up to 1024/sampleRate seconds of audio that can still be
+  // sitting in the DMA buffer, unplayed, the instant the last i2s_write()
+  // call returns. The legacy driver.h API used here has no blocking
+  // "wait until the DMA queue is actually empty" call, so this waits
+  // that worst-case duration (plus a small margin) before tearing the
+  // peripheral down, giving the DMA buffer time to actually finish
+  // draining out to the speaker.
+  uint32_t drainMs = (1024UL * 1000UL / info.sampleRate) + 30;
+  delay(drainMs);
 
   i2sTeardown();
   Serial.println("[PLAY] Finished");
