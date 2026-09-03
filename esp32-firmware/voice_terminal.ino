@@ -573,6 +573,20 @@ void finalizeRecording() {
 // upload step when the request can be written directly to the socket in
 // small chunks instead, matching the same streaming approach used for
 // recording and playback.
+// Diagnostic-only helper: WiFiClientSecure exposes lastError()/
+// lastError(buf,len) on arduino-esp32, which wraps mbedTLS's error
+// string. Not all core versions expose the same overload, so this is
+// intentionally defensive (returns a plain "(no TLS error detail)"
+// rather than failing to compile) instead of assuming one exact
+// signature. Called only for logging — never affects control flow.
+static String tlsErrorDetail(WiFiClientSecure &client) {
+  char errBuf[128];
+  errBuf[0] = '\0';
+  int err = client.lastError(errBuf, sizeof(errBuf));
+  if (err == 0 && errBuf[0] == '\0') return String("(no TLS error reported)");
+  return String("lastError=") + String(err) + " \"" + String(errBuf) + "\"";
+}
+
 bool uploadRecording() {
   Serial.println("UPLOADING");
 
@@ -582,6 +596,19 @@ bool uploadRecording() {
     return false;
   }
   size_t fileSize = f.size();
+
+  // Host/port extracted from VOICE_UPLOAD_URL
+  // ("https://njpxixfcctodjejtgmwj.supabase.co/functions/v1/voice-upload"):
+  // host = everything between "https://" and the next "/", port 443 is
+  // implied by the https scheme (this firmware never parses the URL
+  // string at runtime — the host below is a separate hardcoded literal
+  // that must stay in sync with VOICE_UPLOAD_URL by inspection; printing
+  // both here makes any future drift between them visible in Serial
+  // instead of failing silently).
+  const char *UPLOAD_HOST = "njpxixfcctodjejtgmwj.supabase.co";
+  const uint16_t UPLOAD_PORT = 443;
+  Serial.printf("[UPLOAD] Target URL:  %s\n", VOICE_UPLOAD_URL);
+  Serial.printf("[UPLOAD] Host:Port:   %s:%u\n", UPLOAD_HOST, UPLOAD_PORT);
 
   WiFiClientSecure client;
   // Prototype-only: skips TLS certificate validation. Isolated here and
@@ -603,38 +630,157 @@ bool uploadRecording() {
   String tail = "\r\n--" + boundary + "--\r\n";
 
   size_t totalLen = head.length() + fileSize + tail.length();
+  Serial.printf("[UPLOAD] WAV file size:      %u bytes\n", (unsigned)fileSize);
+  Serial.printf("[UPLOAD] Multipart head/tail: %u / %u bytes\n", (unsigned)head.length(), (unsigned)tail.length());
+  Serial.printf("[UPLOAD] Content-Length:      %u bytes\n", (unsigned)totalLen);
 
-  if (!client.connect("njpxixfcctodjejtgmwj.supabase.co", 443)) {
-    Serial.println("UPLOAD_ERROR: TLS connect failed.");
+  // ---- 1/2: DNS + TCP/TLS connection ----
+  unsigned long connectStart = millis();
+  bool connectOk = client.connect(UPLOAD_HOST, UPLOAD_PORT);
+  unsigned long connectMs = millis() - connectStart;
+
+  Serial.printf("[UPLOAD] client.connect() returned: %s (took %lu ms)\n", connectOk ? "true" : "false", connectMs);
+  Serial.printf("[UPLOAD] client.connected() immediately after: %s\n", client.connected() ? "true" : "false");
+
+  if (!connectOk) {
+    Serial.println("TLS CONNECT FAILED");
+    Serial.println("[UPLOAD] " + tlsErrorDetail(client));
+    // A fast failure (well under typical DNS/TCP timeouts) suggests DNS
+    // or an immediate TCP refusal; a slow failure close to the library's
+    // internal connect timeout suggests the TLS handshake itself hung or
+    // was rejected server-side. This firmware does not currently set an
+    // explicit setTimeout()/setHandshakeTimeout() before connect(), so
+    // "slow" here means whatever WiFiClientSecure's own default is.
+    Serial.printf("[UPLOAD] Diagnostic: connect took %lu ms — %s\n", connectMs,
+                  connectMs < 1000 ? "fast failure (check DNS/TCP reachability)"
+                                    : "slow failure (check TLS handshake/server)");
     f.close();
     return false;
   }
 
-  client.println("POST /functions/v1/voice-upload HTTP/1.1");
-  client.println("Host: njpxixfcctodjejtgmwj.supabase.co");
-  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
-  client.println("Content-Length: " + String(totalLen));
-  client.println("Connection: close");
-  client.println();
-  client.print(head);
+  // ---- 3: HTTP request/header write ----
+  // Every print()/write() used for headers or multipart boundaries is
+  // now checked against its expected return length. Arduino's Print
+  // class returns the number of bytes actually accepted, same contract
+  // as File::write() already relied on elsewhere in this file.
+  bool headerWriteOk = true;
+  auto checkedPrintln = [&](const String &s) {
+    size_t expected = s.length() + 2; // println appends \r\n
+    size_t got = client.println(s);
+    if (got != expected) {
+      Serial.printf("[UPLOAD] header write short: expected %u wrote %u for: %s\n", (unsigned)expected, (unsigned)got, s.c_str());
+      headerWriteOk = false;
+    }
+  };
 
-  // Stream the file in chunks rather than loading it whole into RAM.
+  checkedPrintln("POST /functions/v1/voice-upload HTTP/1.1");
+  checkedPrintln("Host: " + String(UPLOAD_HOST));
+  checkedPrintln("Content-Type: multipart/form-data; boundary=" + boundary);
+  checkedPrintln("Content-Length: " + String(totalLen));
+  checkedPrintln("Connection: close");
+  {
+    size_t got = client.println();
+    if (got != 2) { Serial.printf("[UPLOAD] blank header line short: wrote %u\n", (unsigned)got); headerWriteOk = false; }
+  }
+  {
+    size_t got = client.print(head);
+    if (got != head.length()) {
+      Serial.printf("[UPLOAD] multipart head write short: expected %u wrote %u\n", (unsigned)head.length(), (unsigned)got);
+      headerWriteOk = false;
+    }
+  }
+
+  if (!headerWriteOk) {
+    Serial.println("UPLOAD BODY WRITE FAILED at 0");
+    Serial.printf("[UPLOAD] client.connected() after header write: %s\n", client.connected() ? "true" : "false");
+    Serial.println("[UPLOAD] " + tlsErrorDetail(client));
+    f.close();
+    client.stop();
+    return false;
+  }
+  Serial.println("[UPLOAD] Headers + multipart head written OK.");
+
+  // ---- 4: multipart body (WAV) write, streamed in chunks ----
+  // Still never buffers the whole file — same 512-byte chunking as
+  // before, only the progress logging and per-chunk write verification
+  // are new. Progress is printed every ~32KB, not every chunk, per the
+  // requirement not to spam Serial.
   uint8_t buf[512];
+  size_t sentBytes = 0;
+  size_t lastProgressLog = 0;
+  bool bodyWriteOk = true;
+
   while (f.available()) {
     size_t n = f.read(buf, sizeof(buf));
-    client.write(buf, n);
+    size_t w = client.write(buf, n);
+    if (w != n) {
+      Serial.printf("UPLOAD BODY WRITE FAILED at %u\n", (unsigned)sentBytes);
+      Serial.printf("[UPLOAD] chunk requested %u wrote %u\n", (unsigned)n, (unsigned)w);
+      Serial.printf("[UPLOAD] client.connected(): %s\n", client.connected() ? "true" : "false");
+      Serial.println("[UPLOAD] " + tlsErrorDetail(client));
+      bodyWriteOk = false;
+      break;
+    }
+    sentBytes += w;
+
+    if (sentBytes - lastProgressLog >= 32768) {
+      Serial.printf("[UPLOAD] Progress: %u / %u bytes\n", (unsigned)sentBytes, (unsigned)fileSize);
+      lastProgressLog = sentBytes;
+    }
   }
   f.close();
-  client.print(tail);
 
-  // ---- read response ----
+  if (!bodyWriteOk) {
+    client.stop();
+    return false;
+  }
+  Serial.printf("[UPLOAD] WAV body sent: %u / %u bytes\n", (unsigned)sentBytes, (unsigned)fileSize);
+
+  // ---- final multipart boundary ----
+  {
+    size_t got = client.print(tail);
+    if (got != tail.length()) {
+      Serial.printf("UPLOAD BODY WRITE FAILED at %u\n", (unsigned)sentBytes);
+      Serial.printf("[UPLOAD] final boundary write short: expected %u wrote %u\n", (unsigned)tail.length(), (unsigned)got);
+      Serial.printf("[UPLOAD] client.connected(): %s\n", client.connected() ? "true" : "false");
+      Serial.println("[UPLOAD] " + tlsErrorDetail(client));
+      client.stop();
+      return false;
+    }
+  }
+  Serial.println("[UPLOAD] Final multipart boundary sent OK. Waiting for response...");
+
+  // ---- 5: server response read ----
   unsigned long start = millis();
   while (client.connected() && !client.available() && (millis() - start) < 20000) {
     delay(10);
   }
+  unsigned long waitedMs = millis() - start;
 
+  Serial.printf("[UPLOAD] After response wait (%lu ms): client.available()=%d client.connected()=%s\n",
+                waitedMs, client.available(), client.connected() ? "true" : "false");
+
+  if (!client.available()) {
+    Serial.println("NO HTTP RESPONSE");
+    Serial.println("[UPLOAD] " + tlsErrorDetail(client));
+    client.stop();
+    return false;
+  }
+
+  // ---- 6: actual HTTP response ----
   String statusLine = client.readStringUntil('\n');
   Serial.println("UPLOAD HTTP RESPONSE: " + statusLine);
+
+  if (statusLine.length() == 0) {
+    // available() was true but nothing readable arrived — connection
+    // dropped mid-response rather than never responding at all; distinct
+    // from the NO HTTP RESPONSE case above, worth telling apart in logs.
+    Serial.println("NO HTTP RESPONSE");
+    Serial.printf("[UPLOAD] client.connected() after empty status line: %s\n", client.connected() ? "true" : "false");
+    Serial.println("[UPLOAD] " + tlsErrorDetail(client));
+    client.stop();
+    return false;
+  }
 
   // Skip headers
   while (client.connected()) {
