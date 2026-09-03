@@ -674,29 +674,92 @@ static String jsonEscape(const String &s) {
   return out;
 }
 
-// One JSON POST to VOICE_UPLOAD_URL. Returns the HTTP status code
-// (negative on transport-level failure, per HTTPClient's own convention)
-// and, on success, the raw response body via `outBody`.
-static int postJson(const String &jsonBody, String &outBody) {
-  WiFiClientSecure client;
-  // Prototype-only: skips TLS certificate validation. Isolated here and
-  // clearly commented — replace with a pinned root CA before any
-  // production deployment of this firmware.
-  client.setInsecure();
+// Second real-hardware defect found after shrinking UPLOAD_CHUNK_BYTES:
+// the failure no longer happens at a fixed byte offset — chunk 0 and 1
+// (2048 bytes) succeeded, then chunk 2 failed with the same -11 read
+// timeout. A failure that moves to a different chunk index between runs,
+// rather than a fixed size, points away from "this specific request is
+// too big" and toward resource exhaustion that accumulates across many
+// requests in the same session. postJson() previously constructed a
+// brand-new WiFiClientSecure + HTTPClient PER CHUNK (~150 times for a
+// single recording at 1024 bytes/chunk) — this is a real, documented
+// defect class in arduino-esp32's WiFiClientSecure: its destructor /
+// stop_ssl_socket() path has known cases of not fully releasing TLS
+// resources (certificates, the underlying socket) between instances,
+// causing heap fragmentation or socket exhaustion that worsens with each
+// repeated connect/destroy cycle rather than being present from the
+// first call — exactly matching "works for a while, then silently stops
+// responding."
+//
+// Fix: reuse ONE WiFiClientSecure + HTTPClient pair across every chunk
+// of a single upload (start/chunk*/finish), rather than constructing new
+// ones per call. This is HTTPClient's own supported usage pattern —
+// calling begin()/POST() repeatedly on the same HTTPClient instance
+// reuses the underlying TCP/TLS connection via its own _reuse/_canReuse
+// keep-alive logic (confirmed in the real HTTPClient.cpp source) rather
+// than tearing down and rebuilding TLS state on every single request —
+// which sidesteps the leaky-repeated-construction defect entirely
+// instead of merely working around its symptoms, and additionally saves
+// a full TLS handshake per chunk. Falls back to a one-time reconnect (via
+// http.end() + a fresh begin()) if a request fails, so a genuine network
+// blip mid-upload isn't fatal on the first retry.
 
-  HTTPClient http;
-  if (!http.begin(client, VOICE_UPLOAD_URL)) {
+static WiFiClientSecure g_uploadClient;
+static HTTPClient g_uploadHttp;
+static bool g_uploadClientReady = false;
+
+static bool ensureUploadClient() {
+  if (g_uploadClientReady) return true;
+
+  g_uploadClient.setInsecure(); // prototype-only, see the note this replaces
+  if (!g_uploadHttp.begin(g_uploadClient, VOICE_UPLOAD_URL)) return false;
+  g_uploadHttp.setConnectTimeout(10000);
+  g_uploadHttp.setTimeout(10000);
+  g_uploadHttp.addHeader("Content-Type", "application/json");
+  g_uploadClientReady = true;
+  return true;
+}
+
+// One JSON POST to VOICE_UPLOAD_URL, reusing the persistent connection
+// set up by ensureUploadClient() across the whole start/chunk*/finish
+// sequence. Returns the HTTP status code (negative on transport-level
+// failure, per HTTPClient's own convention) and, on success, the raw
+// response body via `outBody`. On any transport-level failure, tears the
+// persistent connection down and retries exactly once on a freshly
+// rebuilt one — one dropped connection mid-upload shouldn't fail the
+// whole recording if a clean reconnect fixes it.
+static int postJsonOnce(const String &jsonBody, String &outBody) {
+  if (!ensureUploadClient()) {
     outBody = "";
     return -1;
   }
-  http.setConnectTimeout(10000);
-  http.setTimeout(10000); // each request body is now only a few KB; no need for the long timeouts the failed single-shot approach needed
-  http.addHeader("Content-Type", "application/json");
-
-  int code = http.POST(jsonBody);
-  outBody = (code > 0) ? http.getString() : http.errorToString(code);
-  http.end();
+  int code = g_uploadHttp.POST(jsonBody);
+  outBody = (code > 0) ? g_uploadHttp.getString() : g_uploadHttp.errorToString(code);
   return code;
+}
+
+static int postJson(const String &jsonBody, String &outBody) {
+  int code = postJsonOnce(jsonBody, outBody);
+  if (code > 0) return code;
+
+  // Transport-level failure: the persistent connection may be in a bad
+  // state (e.g. the peer closed it) — tear it down and retry once on a
+  // clean one rather than leaving future chunk calls stuck reusing a
+  // connection that's already broken.
+  Serial.printf("[UPLOAD] postJson transport failure (%d), reconnecting and retrying once...\n", code);
+  g_uploadHttp.end();
+  g_uploadClientReady = false;
+  return postJsonOnce(jsonBody, outBody);
+}
+
+// Called once a full upload cycle (start/chunk*/finish) is over, success
+// or failure, so the persistent connection doesn't sit open indefinitely
+// between recordings and the next upload starts from a clean state.
+static void closeUploadClient() {
+  if (g_uploadClientReady) {
+    g_uploadHttp.end();
+    g_uploadClientReady = false;
+  }
 }
 
 bool uploadRecording() {
@@ -720,6 +783,7 @@ bool uploadRecording() {
   if (startCode != 200) {
     Serial.println("[ERROR] Upload session start failed.");
     f.close();
+    closeUploadClient();
     return false;
   }
 
@@ -727,6 +791,7 @@ bool uploadRecording() {
   if (sidIdx < 0) {
     Serial.println("[ERROR] start response missing session_id.");
     f.close();
+    closeUploadClient();
     return false;
   }
   sidIdx += strlen("\"session_id\":\"");
@@ -734,6 +799,7 @@ bool uploadRecording() {
   if (sidEnd < 0) {
     Serial.println("[ERROR] start response malformed session_id.");
     f.close();
+    closeUploadClient();
     return false;
   }
   String sessionId = startResp.substring(sidIdx, sidEnd);
@@ -762,14 +828,21 @@ bool uploadRecording() {
     String chunkResp;
     int chunkCode = postJson(chunkReq, chunkResp);
     if (chunkCode != 200) {
-      Serial.printf("[ERROR] chunk upload failed at byte %u -> HTTP %d: %s\n", (unsigned)sent, chunkCode, chunkResp.c_str());
+      // Free heap logged specifically on failure -- if the persistent-
+      // connection fix (this commit) does not fully resolve the
+      // intermittent read-timeout failures, this is the data needed to
+      // tell "still leaking, just slower" (low/falling free heap) apart
+      // from "different cause entirely" (heap healthy) on the very next
+      // real-hardware attempt, instead of guessing again.
+      Serial.printf("[ERROR] chunk upload failed at byte %u -> HTTP %d: %s (free heap=%u)\n",
+                    (unsigned)sent, chunkCode, chunkResp.c_str(), (unsigned)ESP.getFreeHeap());
       chunkFailed = true;
       break;
     }
 
     sent += n;
     if (sent - lastProgressLog >= 32768 || (size_t)sent >= fileSize) {
-      Serial.printf("[UPLOAD] Progress: %u / %u\n", (unsigned)sent, (unsigned)fileSize);
+      Serial.printf("[UPLOAD] Progress: %u / %u (free heap=%u)\n", (unsigned)sent, (unsigned)fileSize, (unsigned)ESP.getFreeHeap());
       lastProgressLog = sent;
     }
   }
@@ -779,6 +852,7 @@ bool uploadRecording() {
     // Best-effort: nothing more we can do with this session server-side
     // (it will simply expire and be swept), and the recording is still
     // on LittleFS for the existing retry-on-next-touch behavior.
+    closeUploadClient();
     return false;
   }
 
@@ -787,6 +861,7 @@ bool uploadRecording() {
   String finishResp;
   int finishCode = postJson(finishReq, finishResp);
   Serial.printf("[UPLOAD] finish -> HTTP %d: %s\n", finishCode, finishResp.c_str());
+  closeUploadClient();
 
   bool ok = (finishCode == 200);
   if (ok) {
