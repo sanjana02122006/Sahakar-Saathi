@@ -713,32 +713,203 @@ static String jsonEscape(const String &s) {
 // (fresh connection per call + 1024-byte chunks) is the one pairing not
 // yet tried on real hardware.
 
-// One JSON POST to VOICE_UPLOAD_URL. Returns the HTTP status code
-// (negative on transport-level failure, per HTTPClient's own convention)
-// and, on success, the raw response body via `outBody`. Deliberately a
-// fresh WiFiClientSecure + HTTPClient EVERY call, with end() called
-// unconditionally before returning — see the comment above for exactly
-// why connection reuse across calls is not safe here.
+// Third real-hardware result: fresh connection, healthy heap (184620
+// bytes), first request on the connection -- and the very first chunk
+// (1024 raw bytes, ~1400-byte JSON+base64 body) STILL failed with -11,
+// with no server-side log line at all (confirmed again via Supabase
+// function logs: only "booted", no "[UPLOAD] request received"). This
+// rules out BOTH prior hypotheses (repeated-construction leak, and
+// connection-reuse corruption) at once, since neither applies here.
+//
+// Verified directly against the live backend (not assumed): sent raw
+// chunk bodies of 64/256/512/768/1024 bytes via curl to this exact
+// session/endpoint -- ALL succeeded in under 3 seconds, including the
+// same 1024-byte size that fails 100% of the time from the ESP32. The
+// backend has no issue at any tested size. The failure is entirely
+// within the ESP32's own write path for this body length, specifically
+// inside HTTPClient::POST()'s black-box internals (its connect() + header
+// write + body write sequence) -- and since the smallest change that
+// could be isolated (chunk size, connection reuse) has now been tried
+// and neither fixed it, the remaining unverified component is
+// HTTPClient::POST()'s own internal body-write loop itself.
+//
+// Fix: stop delegating the body write to HTTPClient::POST() at all.
+// Write the HTTP request directly over WiFiClientSecure -- headers, then
+// the body in small fixed sub-writes with the return value of EVERY
+// single write() call checked and retried on a short write, rather than
+// trusting any library-internal loop to do this correctly. This is the
+// same explicit-verify-every-write discipline already used for LittleFS
+// writes in pollAndPlayResponse() below, applied to the network write
+// that has now been shown to be the actual point of failure.
+static bool writeAllRetry(WiFiClientSecure &client, const uint8_t *data, size_t len) {
+  size_t sent = 0;
+  const size_t SUBWRITE = 256; // small enough to have been directly verified working via curl at this and smaller sizes
+  unsigned long lastProgress = millis();
+  while (sent < len) {
+    size_t toWrite = min(SUBWRITE, len - sent);
+    size_t n = client.write(data + sent, toWrite);
+    if (n > 0) {
+      sent += n;
+      lastProgress = millis();
+    } else {
+      if (!client.connected()) return false; // connection genuinely gone -- no point retrying
+      if (millis() - lastProgress > 10000) return false; // stalled with zero progress for 10s -- give up rather than hang forever
+      delay(5);
+    }
+  }
+  return true;
+}
+
+// One JSON POST to VOICE_UPLOAD_URL, written manually over WiFiClientSecure
+// (see the comment above for exactly why HTTPClient::POST() is no longer
+// used for the body). Returns the HTTP status code (negative on
+// transport-level failure) and, on success, the raw response body via
+// `outBody`. Fresh WiFiClientSecure per call -- no connection reuse.
 static int postJson(const String &jsonBody, String &outBody) {
   WiFiClientSecure client;
   // Prototype-only: skips TLS certificate validation. Isolated here and
   // clearly commented — replace with a pinned root CA before any
   // production deployment of this firmware.
   client.setInsecure();
+  // NetworkClientSecure (what WiFiClientSecure is typedef'd to on this
+  // core -- confirmed against the real header, not assumed) has no
+  // general setTimeout(uint32_t); only setConnectionTimeout(uint32_t)
+  // for the connect() phase and setHandshakeTimeout() for the TLS
+  // handshake specifically. Every read/write below already has its own
+  // explicit millis()-based timeout loop (writeAllRetry, and the
+  // available()/connected() polling before each readStringUntil/
+  // readBytes call), so no Stream-level timeout is relied on for
+  // correctness -- readStringUntil() only runs after available() is
+  // already confirmed true, so it returns promptly.
+  client.setConnectionTimeout(10000);
 
-  HTTPClient http;
-  if (!http.begin(client, VOICE_UPLOAD_URL)) {
+  // Host is fixed and known (VOICE_UPLOAD_URL always points at this
+  // project's Supabase functions host) -- extracting it from the full
+  // URL string here avoids depending on HTTPClient's own URL parser for
+  // this manual-write path.
+  static const char *HOST = "njpxixfcctodjejtgmwj.supabase.co";
+  static const char *PATH = "/functions/v1/voice-upload";
+
+  if (!client.connect(HOST, 443)) {
     outBody = "";
     return -1;
   }
-  http.setConnectTimeout(10000);
-  http.setTimeout(10000);
-  http.addHeader("Content-Type", "application/json");
 
-  int code = http.POST(jsonBody);
-  outBody = (code > 0) ? http.getString() : http.errorToString(code);
-  http.end();
-  return code;
+  String headers;
+  headers.reserve(160);
+  headers += "POST " + String(PATH) + " HTTP/1.1\r\n";
+  headers += "Host: " + String(HOST) + "\r\n";
+  headers += "Content-Type: application/json\r\n";
+  headers += "Content-Length: " + String(jsonBody.length()) + "\r\n";
+  headers += "Connection: close\r\n\r\n";
+
+  if (!writeAllRetry(client, (const uint8_t *)headers.c_str(), headers.length())) {
+    client.stop();
+    outBody = "";
+    return -2;
+  }
+  if (!writeAllRetry(client, (const uint8_t *)jsonBody.c_str(), jsonBody.length())) {
+    client.stop();
+    outBody = "";
+    return -3;
+  }
+
+  // ---- read the response ----
+  unsigned long waitStart = millis();
+  while (!client.available() && client.connected()) {
+    if (millis() - waitStart > 10000) {
+      client.stop();
+      outBody = "";
+      return -11; // same convention as HTTPC_ERROR_READ_TIMEOUT for continuity with prior logs
+    }
+    delay(5);
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  int statusCode = -1;
+  int firstSpace = statusLine.indexOf(' ');
+  if (firstSpace > 0) {
+    int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
+    String codeStr = secondSpace > 0 ? statusLine.substring(firstSpace + 1, secondSpace) : statusLine.substring(firstSpace + 1);
+    statusCode = codeStr.toInt();
+  }
+  if (statusCode <= 0) {
+    client.stop();
+    outBody = "";
+    return -1;
+  }
+
+  // Skip response headers -- this manual path only needs the status code
+  // and body (matching what the caller previously got from HTTPClient),
+  // not individual header values.
+  bool chunked = false;
+  while (true) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break; // blank line = end of headers
+    String lower = line;
+    lower.toLowerCase();
+    if (lower.indexOf("transfer-encoding:") >= 0 && lower.indexOf("chunked") >= 0) chunked = true;
+  }
+
+  outBody = "";
+  if (chunked) {
+    // Minimal chunked-transfer decode: hex size line, that many bytes,
+    // trailing CRLF, repeat until a zero-size chunk.
+    while (true) {
+      String sizeLine = client.readStringUntil('\n');
+      sizeLine.trim();
+      long chunkSize = strtol(sizeLine.c_str(), nullptr, 16);
+      if (chunkSize <= 0) break;
+      char *buf = (char *)malloc(chunkSize + 1);
+      if (!buf) break;
+      int readTotal = 0;
+      unsigned long readStart = millis();
+      bool chunkTimedOut = false;
+      while (readTotal < chunkSize) {
+        if (client.available()) {
+          int n = client.readBytes(buf + readTotal, chunkSize - readTotal);
+          readTotal += n;
+          readStart = millis(); // reset on real progress, same pattern as writeAllRetry
+        } else if (millis() - readStart > 10000) {
+          chunkTimedOut = true;
+          break;
+        } else {
+          delay(2);
+        }
+      }
+      buf[readTotal] = '\0';
+      outBody += buf;
+      free(buf);
+      // A short/timed-out chunk body leaves the stream desynced from the
+      // chunked-encoding framing (the trailing CRLF this chunk should end
+      // with is not where a short read left the cursor) -- stop parsing
+      // immediately rather than reading a bogus "next chunk size" out of
+      // what is actually still this chunk's own body.
+      if (chunkTimedOut) break;
+      client.readStringUntil('\n'); // trailing CRLF after each chunk
+    }
+  } else {
+    // Not expected in practice -- this endpoint always sends chunked
+    // responses (confirmed via curl -v against the live server) -- but
+    // kept correct rather than left as a possible infinite loop: bails
+    // after 10s with no new byte, same convention as every other wait
+    // loop in this function.
+    unsigned long lastByte = millis();
+    while (client.connected() || client.available()) {
+      if (client.available()) {
+        outBody += (char)client.read();
+        lastByte = millis();
+      } else if (millis() - lastByte > 10000) {
+        break;
+      } else {
+        delay(2);
+      }
+      if (outBody.length() > 4096) break; // response bodies from this endpoint are always small JSON; a runaway read is a bug elsewhere, not a real response
+    }
+  }
+
+  client.stop();
+  return statusCode;
 }
 
 bool uploadRecording() {
