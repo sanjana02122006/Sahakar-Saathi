@@ -71,17 +71,25 @@ export default function DashboardPage() {
    * Fallback: browser Web Speech API — used automatically if Sarvam isn't
    * configured yet, a request fails, or the device has no MediaRecorder support.
    *
-   * autoSendRef tracks whether the CURRENT recording was started by the
-   * hardware push-to-talk button rather than a manual mic-button click.
-   * For hardware input there's no user left to review/edit the transcript
-   * before sending — release already signaled "I'm done speaking" — so the
-   * question is sent automatically the moment transcription completes.
-   * A manual click leaves the transcript in the composer for the user to
-   * edit/send themselves, unchanged from before.
+   * autoSend is decided ONCE, at the moment a recording starts, and passed
+   * as a plain function argument all the way through to wherever that
+   * SAME recording's transcript resolves — never read back out of a shared
+   * mutable ref inside an async callback. A hardware-triggered recording
+   * can take a couple of seconds to transcribe; if a shared ref were used
+   * instead, any later manual click (or a second hardware trigger) during
+   * that window could flip the flag before the first recording's callback
+   * runs, silently turning off auto-send for an utterance that already
+   * asked for it. Capturing the value in the closure makes each
+   * recording's send-vs-review decision immune to whatever happens after
+   * it started.
+   *
+   * Hardware trigger (touch-hold-release): release already signals
+   * "I'm done speaking" — there's no one at the keyboard to review before
+   * sending, so autoSend=true sends the moment transcription completes.
+   * Manual mic-button click: autoSend=false, transcript lands in the
+   * composer for the user to review/edit/send themselves, unchanged.
    */
-  const autoSendRef = useRef(false);
-
-  const webSpeechFallback = useCallback(() => {
+  const webSpeechFallback = useCallback((autoSend: boolean) => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) { alert(t("dashboard.connectionError")); return; }
 
@@ -90,7 +98,7 @@ export default function DashboardPage() {
     rec.interimResults = false;
     rec.onresult = (e: any) => {
       const text = e.results[0][0].transcript;
-      if (autoSendRef.current && text.trim()) send(text);
+      if (autoSend && text.trim()) send(text);
       else setInput(text);
     };
     rec.onend = () => setListening(false);
@@ -105,9 +113,9 @@ export default function DashboardPage() {
     setListening(false);
   }, []);
 
-  const startSarvamRecording = useCallback(async () => {
+  const startSarvamRecording = useCallback(async (autoSend: boolean) => {
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      webSpeechFallback();
+      webSpeechFallback(autoSend);
       return;
     }
 
@@ -140,15 +148,15 @@ export default function DashboardPage() {
           const data = await res.json();
           if (!res.ok || data.unsupported) {
             // Not configured yet, or the request failed — fall back silently.
-            webSpeechFallback();
+            webSpeechFallback(autoSend);
             return;
           }
           if (data.text) {
-            if (autoSendRef.current && data.text.trim()) send(data.text);
+            if (autoSend && data.text.trim()) send(data.text);
             else setInput(data.text);
           }
         } catch {
-          webSpeechFallback();
+          webSpeechFallback(autoSend);
         } finally {
           setTranscribing(false);
         }
@@ -159,7 +167,7 @@ export default function DashboardPage() {
       setListening(true);
     } catch {
       // Mic permission denied or unavailable — try Web Speech, which has its own prompt.
-      webSpeechFallback();
+      webSpeechFallback(autoSend);
     }
   }, [lang, webSpeechFallback]);
 
@@ -169,8 +177,7 @@ export default function DashboardPage() {
       else recognitionRef.current?.stop();
       return;
     }
-    autoSendRef.current = false; // manual click — leave transcript in composer to review/edit
-    startSarvamRecording();
+    startSarvamRecording(false); // manual click — leave transcript in composer to review/edit
   }, [listening, startSarvamRecording, stopSarvamRecording]);
 
   /* ---------- hardware trigger (ESP32 push-to-talk button) ----------
@@ -207,8 +214,7 @@ export default function DashboardPage() {
 
         if (action === "start") {
           if (listeningRef.current) return; // already recording — no double-start
-          autoSendRef.current = true; // hardware trigger — send as soon as transcription completes
-          startSarvamRecording();
+          startSarvamRecording(true); // hardware trigger — send as soon as transcription completes
         } else if (action === "stop") {
           if (!listeningRef.current) return; // nothing to stop
           stopSarvamRecording();
