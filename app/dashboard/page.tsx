@@ -70,7 +70,17 @@ export default function DashboardPage() {
    * Primary: record audio, send to the `transcribe` Edge Function (Sarvam AI Saaras v3 STT).
    * Fallback: browser Web Speech API — used automatically if Sarvam isn't
    * configured yet, a request fails, or the device has no MediaRecorder support.
+   *
+   * autoSendRef tracks whether the CURRENT recording was started by the
+   * hardware push-to-talk button rather than a manual mic-button click.
+   * For hardware input there's no user left to review/edit the transcript
+   * before sending — release already signaled "I'm done speaking" — so the
+   * question is sent automatically the moment transcription completes.
+   * A manual click leaves the transcript in the composer for the user to
+   * edit/send themselves, unchanged from before.
    */
+  const autoSendRef = useRef(false);
+
   const webSpeechFallback = useCallback(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) { alert(t("dashboard.connectionError")); return; }
@@ -78,7 +88,11 @@ export default function DashboardPage() {
     const rec = new SR();
     rec.lang = BCP47[lang] || "en-IN";
     rec.interimResults = false;
-    rec.onresult = (e: any) => setInput(e.results[0][0].transcript);
+    rec.onresult = (e: any) => {
+      const text = e.results[0][0].transcript;
+      if (autoSendRef.current && text.trim()) send(text);
+      else setInput(text);
+    };
     rec.onend = () => setListening(false);
     rec.onerror = () => setListening(false);
     rec.start();
@@ -129,7 +143,10 @@ export default function DashboardPage() {
             webSpeechFallback();
             return;
           }
-          if (data.text) setInput(data.text);
+          if (data.text) {
+            if (autoSendRef.current && data.text.trim()) send(data.text);
+            else setInput(data.text);
+          }
         } catch {
           webSpeechFallback();
         } finally {
@@ -152,6 +169,7 @@ export default function DashboardPage() {
       else recognitionRef.current?.stop();
       return;
     }
+    autoSendRef.current = false; // manual click — leave transcript in composer to review/edit
     startSarvamRecording();
   }, [listening, startSarvamRecording, stopSarvamRecording]);
 
@@ -189,6 +207,7 @@ export default function DashboardPage() {
 
         if (action === "start") {
           if (listeningRef.current) return; // already recording — no double-start
+          autoSendRef.current = true; // hardware trigger — send as soon as transcription completes
           startSarvamRecording();
         } else if (action === "stop") {
           if (!listeningRef.current) return; // nothing to stop
