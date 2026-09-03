@@ -561,186 +561,40 @@ void finalizeRecording() {
 }
 
 // ============================================================
-// Upload: chunked JSON session protocol to voice-upload
+// Upload: single multipart/form-data POST to voice-upload
 // ============================================================
 //
-// FINAL root cause (confirmed against real upstream arduino-esp32 source,
-// not guessed): the installed core's WiFiClientSecure/mbedTLS write path
-// (send_ssl_data, inside the core itself, below both WiFiClientSecure and
-// HTTPClient) does not correctly loop/retry on partial mbedtls_ssl_write()
-// returns for long single-shot bodies. This is a real, previously-open
-// upstream defect — fixed in espressif/arduino-esp32 PR #11865, merged
-// 2025-09-24, which explicitly rewrites send_ssl_data() to loop until the
-// full buffer is written and to send large payloads in bounded (4KB)
-// chunks specifically to avoid this class of failure. This firmware
-// cannot assume the installed board package includes that fix. It
-// reproduced as TWO different symptoms of the SAME underlying defect:
-//   - a raw WiFiClientSecure write loop (previous commit) failing
-//     mid-stream at byte 5632 (mbedTLS error 48)
-//   - HTTPClient::sendRequest()'s OWN internal write-retry loop (previous
-//     commit) *also* eventually failing, returning HTTPC_ERROR_SEND_
-//     PAYLOAD_FAILED (-3) after ~15.9s of a ~150-180KB body — because
-//     sendRequest ultimately calls the same broken send_ssl_data()
-//     underneath, extending HTTPClient's own timeouts changed nothing,
-//     which is expected once the defect is understood to be a write-loop
-//     correctness bug, not a timeout.
+// History (kept brief -- see git log for the full investigation): the
+// original single-shot HTTPClient::POST() upload failed on real hardware.
+// This was chased through several hypotheses -- a core-level TLS write
+// defect, then a chunked upload protocol to work around it, then
+// (wrongly) connection-reuse exhaustion, then (wrongly) connection reuse
+// itself -- before the real cause was isolated: HTTPClient::POST()'s own
+// internal body-write path was unreliable on this specific device for
+// request bodies above roughly 1KB, for reasons never fully identified
+// (the installed core's actual TLS write loop, read from its real
+// source, is already correct). Replacing HTTPClient::POST() with a
+// manual write directly over WiFiClientSecure -- every write() call's
+// return value checked and short writes retried, rather than trusting
+// any library-internal loop -- fixed it: a full ~135KB upload as ~133
+// small chunked requests completed successfully on real hardware.
 //
-// The only reliable fix that does not depend on the user's installed core
-// version is architectural: NEVER attempt one large single-shot HTTPS
-// write. Each recording is now uploaded as many small, fully independent
-// HTTPS POST requests — a start/chunk×N/finish session against
-// voice-upload's new JSON protocol (see supabase/functions/voice-upload/
-// index.ts) — where every single POST body is only a few KB, comfortably
-// inside the range that worked correctly before either previous failure
-// occurred (both failures needed several KB of sustained single-write
-// throughput before manifesting). RAM stays bounded: exactly one
-// UPLOAD_CHUNK_BYTES raw buffer plus its base64 encoding exist at a time;
-// the WAV file itself is never loaded into RAM, consistent with every
-// prior version of this firmware.
-
-// Raw bytes read from LittleFS per chunk, before base64 encoding.
+// That confirmed the actual defect was HTTPClient's write path, not
+// request size. Chunking was a workaround for a problem that no longer
+// exists once that path is bypassed, and ~133 requests each paying a
+// full fresh TLS handshake was too slow for a live demo (~60-100s just
+// in handshake overhead). This is the final design: upload the whole WAV
+// as ONE multipart/form-data POST, using the same manual-write
+// discipline that's now proven correct, applied to a single larger body
+// streamed from LittleFS in bounded RAM chunks instead of many small
+// ones. One TLS handshake per recording. Uses voice-upload's ORIGINAL
+// multipart contract (Shape A in that function's own comments) --
+// already deployed, unchanged, no backend redeploy needed.
 //
-// Real-hardware result at 4096 (base64 ~5.5KB body): `start` (a ~110-byte
-// body) always succeeds; the FIRST `chunk` call always fails client-side
-// with HTTPClient error -11 (HTTPC_ERROR_READ_TIMEOUT — confirmed against
-// the real HTTPClient.cpp source: the client believes its write finished
-// and is waiting for a response that never comes). Server-side logs and
-// the session row's received_bytes=0 confirm the request never actually
-// reached voice-upload's handler — this is not a slow backend (a
-// byte-identical 4096-byte chunk sent via curl round-trips in under 1s
-// with the server doing ~50ms of DB work). The only structural
-// difference between the always-working `start` and the always-failing
-// `chunk` is body size (~110B vs ~5.5KB), which is the same dose-
-// dependent signature as the original confirmed defect in this core's
-// TLS write path (send_ssl_data not correctly looping on partial
-// mbedtls_ssl_write() returns — see the FINAL root-cause comment above
-// uploadRecording()), just now surfacing as a silently-lost request
-// instead of an outright write error. Shrinking the chunk size is a
-// firmware constant change only — no protocol/architecture change —
-// and moves every single chunk request's body far below any size this
-// defect has ever been observed to trigger at (first-ever failure was at
-// 5632 bytes cumulative in one write). 1024 raw bytes -> ~1.4KB base64
-// body, 4x smaller than the failing 4096-byte size — chosen over an even
-// smaller size to limit the total number of chunk round trips (each
-// opens a brand-new TLS connection, per postJson()'s design) for a
-// ~130KB recording to roughly 128 rather than 256+, keeping total
-// upload time reasonable for a live demo.
-#define UPLOAD_CHUNK_BYTES 1024
-
-static const char *B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-// Minimal base64 encoder — no library dependency, output written directly
-// into a caller-provided String to avoid a second full-size copy.
-static void base64Encode(const uint8_t *data, size_t len, String &out) {
-  out.reserve(out.length() + ((len + 2) / 3) * 4);
-  size_t i = 0;
-  while (i + 3 <= len) {
-    uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | data[i + 2];
-    out += B64_CHARS[(n >> 18) & 0x3F];
-    out += B64_CHARS[(n >> 12) & 0x3F];
-    out += B64_CHARS[(n >> 6) & 0x3F];
-    out += B64_CHARS[n & 0x3F];
-    i += 3;
-  }
-  size_t rem = len - i;
-  if (rem == 1) {
-    uint32_t n = (uint32_t)data[i] << 16;
-    out += B64_CHARS[(n >> 18) & 0x3F];
-    out += B64_CHARS[(n >> 12) & 0x3F];
-    out += '=';
-    out += '=';
-  } else if (rem == 2) {
-    uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8);
-    out += B64_CHARS[(n >> 18) & 0x3F];
-    out += B64_CHARS[(n >> 12) & 0x3F];
-    out += B64_CHARS[(n >> 6) & 0x3F];
-    out += '=';
-  }
-}
-
-// Escapes a string for embedding inside a JSON string literal. Only
-// device key / session id / lang code / short server text pass through
-// here — small, bounded inputs, so a simple pass is sufficient.
-static String jsonEscape(const String &s) {
-  String out;
-  out.reserve(s.length() + 8);
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') { out += '\\'; out += c; }
-    else if (c == '\n') out += "\\n";
-    else if (c == '\r') out += "\\r";
-    else out += c;
-  }
-  return out;
-}
-
-// Second real-hardware defect found after shrinking UPLOAD_CHUNK_BYTES:
-// the failure no longer happens at a fixed byte offset — chunk 0 and 1
-// (2048 bytes) succeeded, then chunk 2 failed with the same -11 read
-// timeout. That looked at the time like resource exhaustion building up
-// across many fresh-connection-per-chunk requests, so a prior version of
-// this function switched to reusing ONE WiFiClientSecure + HTTPClient
-// pair across the whole start/chunk*/finish sequence via HTTPClient's
-// own keep-alive support.
-//
-// That reuse change was ITSELF the bug, confirmed on the next hardware
-// test: `start` on a fresh connection always succeeds; the very FIRST
-// `chunk` POST on that SAME reused connection then always fails with -11
-// — and Supabase's own logs proved the request never even arrived
-// server-side (only `start`'s 113-byte body was ever logged; no
-// `[CHUNK]` log line exists for any of the three attempts, including two
-// automatic reconnect-and-retry attempts, all of which failed the same
-// way). This matches a confirmed defect in HTTPClient's connection-reuse
-// path: after a response, the connection's "can this be reused" check
-// only drains bytes already buffered, not the full response body — if
-// the caller's getString() call raced that drain in any way, the next
-// request's headers can be written into the tail of the previous
-// response's stream, corrupting the connection so the SECOND request on
-// it never parses as a valid request server-side. This explains why
-// `start` (always the first request on a brand-new connection) never
-// failed once across every real-hardware test, while `chunk` (always
-// reusing a connection that already served one prior request) failed
-// every single time reuse was in place.
-//
-// Fix: back to a fresh WiFiClientSecure + HTTPClient per call — end() is
-// called after every single request, so no connection is ever reused for
-// a second request and this defect class cannot trigger. This constant's
-// reduction to 1024 bytes (the actual fix for the ORIGINAL dose-dependent
-// TLS write defect, still valid and unrelated to the reuse bug above) was
-// never actually verified in isolation before this — it had only been
-// tested together with the now-reverted reuse change, which masked
-// whether shrinking the chunk size alone was sufficient. This combination
-// (fresh connection per call + 1024-byte chunks) is the one pairing not
-// yet tried on real hardware.
-
-// Third real-hardware result: fresh connection, healthy heap (184620
-// bytes), first request on the connection -- and the very first chunk
-// (1024 raw bytes, ~1400-byte JSON+base64 body) STILL failed with -11,
-// with no server-side log line at all (confirmed again via Supabase
-// function logs: only "booted", no "[UPLOAD] request received"). This
-// rules out BOTH prior hypotheses (repeated-construction leak, and
-// connection-reuse corruption) at once, since neither applies here.
-//
-// Verified directly against the live backend (not assumed): sent raw
-// chunk bodies of 64/256/512/768/1024 bytes via curl to this exact
-// session/endpoint -- ALL succeeded in under 3 seconds, including the
-// same 1024-byte size that fails 100% of the time from the ESP32. The
-// backend has no issue at any tested size. The failure is entirely
-// within the ESP32's own write path for this body length, specifically
-// inside HTTPClient::POST()'s black-box internals (its connect() + header
-// write + body write sequence) -- and since the smallest change that
-// could be isolated (chunk size, connection reuse) has now been tried
-// and neither fixed it, the remaining unverified component is
-// HTTPClient::POST()'s own internal body-write loop itself.
-//
-// Fix: stop delegating the body write to HTTPClient::POST() at all.
-// Write the HTTP request directly over WiFiClientSecure -- headers, then
-// the body in small fixed sub-writes with the return value of EVERY
-// single write() call checked and retried on a short write, rather than
-// trusting any library-internal loop to do this correctly. This is the
-// same explicit-verify-every-write discipline already used for LittleFS
-// writes in pollAndPlayResponse() below, applied to the network write
-// that has now been shown to be the actual point of failure.
+// writeAllRetry() below is the one piece of transport code shared by
+// both this and the (now-removed) chunked path's postJson() -- explicit
+// per-write verification is what actually fixed the real defect, and
+// stays the core discipline for every network write in this firmware.
 static bool writeAllRetry(WiFiClientSecure &client, const uint8_t *data, size_t len) {
   size_t sent = 0;
   const size_t SUBWRITE = 256; // small enough to have been directly verified working via curl at this and smaller sizes
@@ -760,64 +614,20 @@ static bool writeAllRetry(WiFiClientSecure &client, const uint8_t *data, size_t 
   return true;
 }
 
-// One JSON POST to VOICE_UPLOAD_URL, written manually over WiFiClientSecure
-// (see the comment above for exactly why HTTPClient::POST() is no longer
-// used for the body). Returns the HTTP status code (negative on
-// transport-level failure) and, on success, the raw response body via
-// `outBody`. Fresh WiFiClientSecure per call -- no connection reuse.
-static int postJson(const String &jsonBody, String &outBody) {
-  WiFiClientSecure client;
-  // Prototype-only: skips TLS certificate validation. Isolated here and
-  // clearly commented — replace with a pinned root CA before any
-  // production deployment of this firmware.
-  client.setInsecure();
-  // NetworkClientSecure (what WiFiClientSecure is typedef'd to on this
-  // core -- confirmed against the real header, not assumed) has no
-  // general setTimeout(uint32_t); only setConnectionTimeout(uint32_t)
-  // for the connect() phase and setHandshakeTimeout() for the TLS
-  // handshake specifically. Every read/write below already has its own
-  // explicit millis()-based timeout loop (writeAllRetry, and the
-  // available()/connected() polling before each readStringUntil/
-  // readBytes call), so no Stream-level timeout is relied on for
-  // correctness -- readStringUntil() only runs after available() is
-  // already confirmed true, so it returns promptly.
-  client.setConnectionTimeout(10000);
-
-  // Host is fixed and known (VOICE_UPLOAD_URL always points at this
-  // project's Supabase functions host) -- extracting it from the full
-  // URL string here avoids depending on HTTPClient's own URL parser for
-  // this manual-write path.
-  static const char *HOST = "njpxixfcctodjejtgmwj.supabase.co";
-  static const char *PATH = "/functions/v1/voice-upload";
-
-  if (!client.connect(HOST, 443)) {
-    outBody = "";
-    return -1;
-  }
-
-  String headers;
-  headers.reserve(160);
-  headers += "POST " + String(PATH) + " HTTP/1.1\r\n";
-  headers += "Host: " + String(HOST) + "\r\n";
-  headers += "Content-Type: application/json\r\n";
-  headers += "Content-Length: " + String(jsonBody.length()) + "\r\n";
-  headers += "Connection: close\r\n\r\n";
-
-  if (!writeAllRetry(client, (const uint8_t *)headers.c_str(), headers.length())) {
-    client.stop();
-    outBody = "";
-    return -2;
-  }
-  if (!writeAllRetry(client, (const uint8_t *)jsonBody.c_str(), jsonBody.length())) {
-    client.stop();
-    outBody = "";
-    return -3;
-  }
-
-  // ---- read the response ----
+// Reads an HTTP response (status line, headers, chunked-or-not body) from
+// an already-connected, already-request-sent WiFiClientSecure. Shared by
+// uploadMultipart() below; factored out rather than duplicated since this
+// parsing logic (especially the chunked-transfer decode) is the one part
+// of the manual-write rewrite worth keeping in exactly one place. Every
+// wait loop has its own explicit millis()-based timeout so nothing can
+// hang indefinitely regardless of what the server does or doesn't send.
+// Returns the HTTP status code, or a negative HTTPClient-style error code
+// on any transport-level failure; `outBody` holds the response body text
+// on success.
+static int readHttpResponse(WiFiClientSecure &client, String &outBody) {
   unsigned long waitStart = millis();
   while (!client.available() && client.connected()) {
-    if (millis() - waitStart > 10000) {
+    if (millis() - waitStart > 15000) {
       client.stop();
       outBody = "";
       return -11; // same convention as HTTPC_ERROR_READ_TIMEOUT for continuity with prior logs
@@ -839,8 +649,7 @@ static int postJson(const String &jsonBody, String &outBody) {
     return -1;
   }
 
-  // Skip response headers -- this manual path only needs the status code
-  // and body (matching what the caller previously got from HTTPClient),
+  // Skip response headers -- only the status code and body are needed,
   // not individual header values.
   bool chunked = false;
   while (true) {
@@ -889,7 +698,7 @@ static int postJson(const String &jsonBody, String &outBody) {
       client.readStringUntil('\n'); // trailing CRLF after each chunk
     }
   } else {
-    // Not expected in practice -- this endpoint always sends chunked
+    // Not expected in practice -- voice-upload always sends chunked
     // responses (confirmed via curl -v against the live server) -- but
     // kept correct rather than left as a possible infinite loop: bails
     // after 10s with no new byte, same convention as every other wait
@@ -912,6 +721,110 @@ static int postJson(const String &jsonBody, String &outBody) {
   return statusCode;
 }
 
+// Fourth real-hardware result: the manual-write postJson() (previous
+// commit) WORKED -- a full chunked upload (133 requests at 1024 bytes
+// each) completed successfully, transcript came back correctly. That
+// confirms the actual defect was HTTPClient::POST()'s internal body-
+// write path, now bypassed. But 133 sequential requests, each paying its
+// own fresh TLS handshake (connect() + full handshake, no reuse), is
+// slow in aggregate -- roughly a minute of pure handshake overhead for a
+// ~135KB recording, which is unacceptable for a live demo.
+//
+// Now that the actual write defect is confirmed fixed (not chunk size,
+// not connection reuse -- the HTTPClient body-write path itself), there
+// is no remaining reason to chunk at all: send the whole WAV as ONE
+// multipart/form-data POST, using the SAME manual-write discipline
+// (explicit write() return value checked and retried, never trusted to
+// a library's internal loop) that just proved itself correct, applied to
+// a single larger body instead of many small ones. This uses
+// voice-upload's ORIGINAL multipart contract (Shape A in that function's
+// own comments) -- already deployed, unchanged, needs no backend
+// redeploy. One TLS handshake per recording instead of ~133.
+static bool uploadMultipart(File &f, size_t fileSize, String &outBody) {
+  WiFiClientSecure client;
+  // Prototype-only: skips TLS certificate validation. Isolated here and
+  // clearly commented -- replace with a pinned root CA before any
+  // production deployment of this firmware.
+  client.setInsecure();
+  client.setConnectionTimeout(10000);
+
+  static const char *HOST = "njpxixfcctodjejtgmwj.supabase.co";
+  static const char *PATH = "/functions/v1/voice-upload";
+
+  String boundary = "----ESP32VoiceBoundary7f3a9c";
+  String head =
+      "--" + boundary + "\r\n"
+      "Content-Disposition: form-data; name=\"device_key\"\r\n\r\n" +
+      String(DEVICE_API_KEY) + "\r\n" +
+      "--" + boundary + "\r\n"
+      "Content-Disposition: form-data; name=\"lang\"\r\n\r\n" +
+      String(UPLOAD_LANG) + "\r\n" +
+      "--" + boundary + "\r\n"
+      "Content-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\n"
+      "Content-Type: audio/wav\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+  size_t totalLen = head.length() + fileSize + tail.length();
+
+  if (!client.connect(HOST, 443)) {
+    outBody = "";
+    return false;
+  }
+
+  String headers;
+  headers.reserve(200);
+  headers += "POST " + String(PATH) + " HTTP/1.1\r\n";
+  headers += "Host: " + String(HOST) + "\r\n";
+  headers += "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n";
+  headers += "Content-Length: " + String(totalLen) + "\r\n";
+  headers += "Connection: close\r\n\r\n";
+
+  if (!writeAllRetry(client, (const uint8_t *)headers.c_str(), headers.length())) {
+    client.stop();
+    outBody = "";
+    return false;
+  }
+  if (!writeAllRetry(client, (const uint8_t *)head.c_str(), head.length())) {
+    client.stop();
+    outBody = "";
+    return false;
+  }
+
+  // Stream the WAV file straight from LittleFS in bounded RAM chunks --
+  // never loaded whole into memory, same guarantee every prior version
+  // of this firmware has kept.
+  static uint8_t fileBuf[4096]; // matches send_ssl_data's own internal 4096-byte sub-write size (confirmed in the real ssl_client.cpp source) -- the natural chunk size to hand it
+  size_t sentFile = 0;
+  uint32_t lastProgressLog = 0;
+  while (sentFile < fileSize) {
+    size_t n = f.read(fileBuf, sizeof(fileBuf));
+    if (n == 0) break; // shouldn't happen given fileSize, but don't loop forever if it does
+    if (!writeAllRetry(client, fileBuf, n)) {
+      client.stop();
+      outBody = "";
+      return false;
+    }
+    sentFile += n;
+    if (sentFile - lastProgressLog >= 32768 || sentFile >= fileSize) {
+      Serial.printf("[UPLOAD] Progress: %u / %u (free heap=%u)\n", (unsigned)sentFile, (unsigned)fileSize, (unsigned)ESP.getFreeHeap());
+      lastProgressLog = sentFile;
+    }
+  }
+
+  if (!writeAllRetry(client, (const uint8_t *)tail.c_str(), tail.length())) {
+    client.stop();
+    outBody = "";
+    return false;
+  }
+
+  // The response only starts arriving after the whole file has finished
+  // uploading AND been transcribed server-side (voice-upload's handler
+  // calls Sarvam before responding), so this can legitimately take a few
+  // seconds longer than a small chunk request's response did -- see
+  // readHttpResponse()'s own 15s wait-for-first-byte timeout.
+  int statusCode = readHttpResponse(client, outBody);
+  return statusCode == 200;
+}
+
 bool uploadRecording() {
   Serial.println("UPLOADING");
 
@@ -922,95 +835,13 @@ bool uploadRecording() {
   }
   size_t fileSize = f.size();
   Serial.printf("[UPLOAD] Target URL:  %s\n", VOICE_UPLOAD_URL);
-  Serial.printf("[UPLOAD] WAV file size: %u bytes, chunk size: %u bytes\n", (unsigned)fileSize, (unsigned)UPLOAD_CHUNK_BYTES);
+  Serial.printf("[UPLOAD] WAV file size: %u bytes (single multipart request)\n", (unsigned)fileSize);
 
-  // ---- start ----
-  String startReq = String("{\"action\":\"start\",\"device_key\":\"") + jsonEscape(DEVICE_API_KEY) +
-                     "\",\"lang\":\"" + jsonEscape(UPLOAD_LANG) + "\"}";
-  String startResp;
-  int startCode = postJson(startReq, startResp);
-  Serial.printf("[UPLOAD] start -> HTTP %d: %s\n", startCode, startResp.c_str());
-  if (startCode != 200) {
-    Serial.println("[ERROR] Upload session start failed.");
-    f.close();
-    return false;
-  }
-
-  int sidIdx = startResp.indexOf("\"session_id\":\"");
-  if (sidIdx < 0) {
-    Serial.println("[ERROR] start response missing session_id.");
-    f.close();
-    return false;
-  }
-  sidIdx += strlen("\"session_id\":\"");
-  int sidEnd = startResp.indexOf('"', sidIdx);
-  if (sidEnd < 0) {
-    Serial.println("[ERROR] start response malformed session_id.");
-    f.close();
-    return false;
-  }
-  String sessionId = startResp.substring(sidIdx, sidEnd);
-  Serial.println("[UPLOAD] session_id: " + sessionId);
-
-  // ---- chunks ----
-  // static, not stack-local: matches the pattern already used for i2sBuf/
-  // pcmBuf elsewhere in this file — keeps this 4KB buffer off the task
-  // stack rather than risking a large single-frame stack allocation.
-  static uint8_t rawBuf[UPLOAD_CHUNK_BYTES];
-  uint32_t sent = 0;
-  uint32_t lastProgressLog = 0;
-  bool chunkFailed = false;
-
-  while (true) {
-    size_t n = f.read(rawBuf, UPLOAD_CHUNK_BYTES);
-    if (n == 0) break; // EOF
-
-    String b64;
-    base64Encode(rawBuf, n, b64);
-
-    String chunkReq;
-    chunkReq.reserve(b64.length() + sessionId.length() + 64);
-    chunkReq = "{\"action\":\"chunk\",\"session_id\":\"" + sessionId + "\",\"data\":\"" + b64 + "\"}";
-
-    String chunkResp;
-    int chunkCode = postJson(chunkReq, chunkResp);
-    if (chunkCode != 200) {
-      // Free heap logged on every failure so a future real-hardware
-      // attempt has this data point without needing another round trip
-      // to add logging first.
-      Serial.printf("[ERROR] chunk upload failed at byte %u -> HTTP %d: %s (free heap=%u)\n",
-                    (unsigned)sent, chunkCode, chunkResp.c_str(), (unsigned)ESP.getFreeHeap());
-      chunkFailed = true;
-      break;
-    }
-
-    sent += n;
-    if (sent - lastProgressLog >= 32768 || (size_t)sent >= fileSize) {
-      Serial.printf("[UPLOAD] Progress: %u / %u (free heap=%u)\n", (unsigned)sent, (unsigned)fileSize, (unsigned)ESP.getFreeHeap());
-      lastProgressLog = sent;
-    }
-  }
+  String resp;
+  bool ok = uploadMultipart(f, fileSize, resp);
   f.close();
 
-  if (chunkFailed) {
-    // Best-effort: nothing more we can do with this session server-side
-    // (it will simply expire and be swept), and the recording is still
-    // on LittleFS for the existing retry-on-next-touch behavior.
-    return false;
-  }
-
-  // ---- finish ----
-  String finishReq = "{\"action\":\"finish\",\"session_id\":\"" + sessionId + "\"}";
-  String finishResp;
-  int finishCode = postJson(finishReq, finishResp);
-  Serial.printf("[UPLOAD] finish -> HTTP %d: %s\n", finishCode, finishResp.c_str());
-
-  bool ok = (finishCode == 200);
-  if (ok) {
-    Serial.println("UPLOAD SUCCESS: " + finishResp);
-  } else {
-    Serial.println("UPLOAD FAILED: " + finishResp);
-  }
+  Serial.printf("[UPLOAD] %s: %s\n", ok ? "SUCCESS" : "FAILED", resp.c_str());
   return ok;
 }
 

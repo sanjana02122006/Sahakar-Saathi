@@ -329,6 +329,27 @@ export default function DashboardPage() {
     }
   }
 
+  // Hard cap on how much text ever gets turned into audio for the ESP32.
+  // The chat model can return up to 800 tokens (~600 words) — fine for
+  // the browser, which has no storage constraint, but the device's
+  // LittleFS partition is ~1.4MB total and a WAV at 16kHz/16-bit/mono
+  // runs ~32KB/second, so an unclipped reply can easily produce a
+  // response WAV LARGER than the entire free partition (confirmed on
+  // real hardware: a 62-second reply produced a ~1.98MB WAV against
+  // ~1.43MB free, and pollAndPlayResponse() correctly refused to even
+  // start downloading it rather than corrupt/truncate the file).
+  // Trimmed to the last sentence boundary at or before the limit so
+  // playback is a complete thought, not a mid-word cutoff.
+  const ESP32_SPEECH_CHAR_LIMIT = 260; // ~15-20s of TTS audio, well under 1MB even in the worst case
+
+  function trimForDeviceSpeech(text: string): string {
+    const trimmed = text.trim();
+    if (trimmed.length <= ESP32_SPEECH_CHAR_LIMIT) return trimmed;
+    const clipped = trimmed.slice(0, ESP32_SPEECH_CHAR_LIMIT);
+    const lastBoundary = Math.max(clipped.lastIndexOf(". "), clipped.lastIndexOf("। "), clipped.lastIndexOf("? "), clipped.lastIndexOf("! "));
+    return lastBoundary > 40 ? clipped.slice(0, lastBoundary + 1) : clipped.trimEnd() + "…";
+  }
+
   // Generates the TTS clip via the SAME `speak` Edge Function used for
   // browser playback, but only ever queues it for the ESP32 — never
   // plays it locally. Kept as its own function (rather than inlined into
@@ -340,10 +361,11 @@ export default function DashboardPage() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
+      const deviceText = trimForDeviceSpeech(text);
       const speakRes = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/speak`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
-        body: JSON.stringify({ text, lang: BCP47[lang] || "en-IN" }),
+        body: JSON.stringify({ text: deviceText, lang: BCP47[lang] || "en-IN" }),
       });
       const speakData = await speakRes.json();
       if (!speakRes.ok || speakData.unsupported || !speakData.audio) {
