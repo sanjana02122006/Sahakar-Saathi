@@ -1200,18 +1200,38 @@ bool playWavFile(const String &path) {
   // by the time it returns, not that they've actually finished playing
   // out through the amp/speaker yet -- calling i2sTeardown() (which
   // uninstalls the I2S driver) immediately after the last write was
-  // cutting the tail of every clip off, exactly matching "it got cut
-  // short". The TX config above sets dma_buf_count=4 * dma_buf_len=256 =
-  // 1024 samples of buffering headroom; at this WAV's own sample rate
-  // that's up to 1024/sampleRate seconds of audio that can still be
-  // sitting in the DMA buffer, unplayed, the instant the last i2s_write()
-  // call returns. The legacy driver.h API used here has no blocking
-  // "wait until the DMA queue is actually empty" call, so this waits
-  // that worst-case duration (plus a small margin) before tearing the
-  // peripheral down, giving the DMA buffer time to actually finish
-  // draining out to the speaker.
-  uint32_t drainMs = (1024UL * 1000UL / info.sampleRate) + 30;
-  delay(drainMs);
+  // cutting the tail of every clip off. A first attempt at fixing this
+  // with a bare delay() sized to the DMA buffer's own nominal depth
+  // (dma_buf_count=4 * dma_buf_len=256 samples) was NOT enough margin on
+  // real hardware -- the tail was still getting clipped. Rather than
+  // guess at a larger fixed number again, this now explicitly writes a
+  // burst of silence (zero) samples through i2s_write() itself after the
+  // real audio, instead of only delay()ing blind: i2s_write() naturally
+  // blocks/paces against the DMA queue's real fill state when the queue
+  // is full, which is a hardware-timed guarantee a bare delay() estimate
+  // is not. By the time these zero-samples have themselves been written
+  // out, every real audio sample queued before them is guaranteed to have
+  // already played (I2S/DMA delivers samples in FIFO order) -- so this is
+  // correct regardless of exactly how much headroom the DMA buffers have,
+  // not dependent on getting a timing estimate right. ~200ms of silence
+  // at whatever the actual output format's bytes-per-sample is.
+  {
+    uint16_t bytesPerSample = (info.bitsPerSample / 8) * (info.numChannels >= 2 ? 2 : 1);
+    uint32_t silenceBytes = (info.sampleRate * bytesPerSample * 200) / 1000; // 200ms of silence
+    static uint8_t silenceBuf[512] = {0}; // already all-zero; no need to memset every call
+    uint32_t silenceRemaining = silenceBytes;
+    while (silenceRemaining > 0) {
+      size_t n = min((uint32_t)sizeof(silenceBuf), silenceRemaining);
+      i2s_write(I2S_NUM_0, silenceBuf, n, &bytesWritten, 100 / portTICK_PERIOD_MS);
+      silenceRemaining -= n;
+    }
+  }
+
+  // Small additional fixed margin on top of the silence write above --
+  // cheap insurance against any remaining scheduling jitter between the
+  // last i2s_write() call returning and the DMA hardware actually having
+  // drained that final buffer.
+  delay(50);
 
   i2sTeardown();
   Serial.println("[PLAY] Finished");
