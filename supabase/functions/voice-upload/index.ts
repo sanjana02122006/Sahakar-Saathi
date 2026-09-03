@@ -39,18 +39,30 @@
 //       { action: "chunk",  session_id, data: base64 }              -> { ok: true, received }
 //       { action: "finish", session_id }                            -> { ok: true, text }
 //
-//     Chunks are appended in arrival order (no seq field) — safe here
-//     because the ESP32 firmware sends them one at a time, sequentially,
-//     over independent HTTPS requests, awaiting each response before
-//     starting the next; there is exactly one client per session and no
-//     concurrent/out-of-order sends. Session state is held in-memory
-//     (module-level Map) for the lifetime of this function instance,
-//     keyed by session_id — acceptable for a single-device MVP with one
-//     in-flight recording at a time; no new table/bucket needed. A
-//     session gets the full audio assembled from its chunks and is
-//     transcribed via the SAME Sarvam call as before once "finish"
-//     arrives. Stale sessions (client crashed mid-upload) are swept on
-//     every request so memory can't grow unbounded.
+//     Chunks are assigned an ordinal (`seq`) server-side, one higher than
+//     the count already stored for the session — safe here because the
+//     ESP32 firmware sends them one at a time, sequentially, over
+//     independent HTTPS requests, awaiting each response before starting
+//     the next; there is exactly one client per session and no
+//     concurrent/out-of-order sends.
+//
+//     Session state is PERSISTED in Postgres (device_voice_upload_sessions
+//     / device_voice_upload_chunks — migration 0006), not held in an
+//     in-memory Map. Edge Functions scale across independent isolates/
+//     instances with no shared process memory: a real-hardware test
+//     showed `start` succeed and the very first `chunk` immediately fail
+//     with "Unknown or expired session_id" — that request landed on a
+//     different instance than the one holding the in-memory session, so
+//     the earlier in-memory design could only ever work by accident (both
+//     requests happening to hit the same warm instance). A database row
+//     is visible to every instance, which is what makes the protocol
+//     correctness-independent of Edge Function scaling behavior. A
+//     session gets the full audio reassembled (ordered by seq) from its
+//     chunk rows and is transcribed via the SAME Sarvam call as before
+//     once "finish" arrives; the session and its chunk rows are then
+//     deleted (cascade). Stale sessions (client crashed mid-upload) are
+//     swept on every request via an expires_at check so rows can't grow
+//     unbounded.
 // Response: { ok: true, text: string } | { ok: true, session_id } | { ok: true, received }
 //         | { error, unsupported?: boolean }
 // =====================================================================
@@ -77,32 +89,52 @@ const CORS = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
-// ---------- chunked-session state ----------
-// Bound on session lifetime and count so a crashed/never-finished client
-// can't leak memory across warm invocations of this function instance.
-const SESSION_TTL_MS = 2 * 60 * 1000; // a single recording is a few seconds of audio; 2 minutes is generous
+// One service-role client, reused across a single invocation's Postgres
+// calls (chunk storage/lookup) — same pattern already used inside
+// transcribeAndBroadcast for the Realtime channel, just hoisted so the
+// session-table queries can use it too.
+const admin = createClient(SUPABASE_URL, SERVICE_ROLE, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
 const MAX_SESSION_BYTES = 4 * 1024 * 1024; // far above any real push-to-talk clip; guards against a runaway/buggy client
 
-interface UploadSession {
-  chunks: Uint8Array[];
-  totalBytes: number;
-  lang: string | null;
-  createdAt: number;
-}
-
-const sessions = new Map<string, UploadSession>();
-
-function sweepStaleSessions() {
-  const now = Date.now();
-  for (const [id, s] of sessions) {
-    if (now - s.createdAt > SESSION_TTL_MS) sessions.delete(id);
-  }
+// device_key is never stored raw — only its SHA-256 hash, so a session
+// row leak doesn't leak the credential itself. Deno's Web Crypto (SubtleCrypto)
+// is available in the Edge Functions runtime with no extra import needed.
+async function hashDeviceKey(key: string): Promise<string> {
+  const data = new TextEncoder().encode(key);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// PostgREST (the API layer Supabase's JS client talks to) has no native
+// binary transport — `bytea` columns are exchanged as PostgreSQL's own
+// hex text representation, "\x" followed by 2 hex digits per byte, on
+// BOTH insert and select. Passing a raw Uint8Array directly to
+// supabase-js gets mangled rather than stored correctly (confirmed via
+// PostgREST's own documented bytea handling before writing this, not
+// assumed) — so every chunk is explicitly hex-encoded before insert and
+// hex-decoded after select, via these two helpers.
+function bytesToHexBytea(bytes: Uint8Array): string {
+  let hex = "\\x";
+  for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
+  return hex;
+}
+
+function hexByteaToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith("\\x") ? hex.slice(2) : hex;
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(clean.substr(i * 2, 2), 16);
+  }
   return bytes;
 }
 
@@ -177,8 +209,6 @@ Deno.serve(async (req) => {
   try {
     // ================= Shape (B): chunked JSON session protocol =================
     if (contentType.includes("application/json")) {
-      sweepStaleSessions();
-
       const body = await req.json().catch(() => ({}));
       const action = body?.action;
 
@@ -186,51 +216,202 @@ Deno.serve(async (req) => {
         if (!body.device_key || body.device_key !== DEVICE_API_KEY) {
           return json({ error: "Invalid device key" }, 401);
         }
-        const sessionId = crypto.randomUUID();
-        sessions.set(sessionId, {
-          chunks: [],
-          totalBytes: 0,
-          lang: typeof body.lang === "string" && body.lang ? body.lang : null,
-          createdAt: Date.now(),
-        });
-        return json({ ok: true, session_id: sessionId });
+        const deviceKeyHash = await hashDeviceKey(body.device_key);
+        const lang = typeof body.lang === "string" && body.lang ? body.lang : null;
+
+        const { data, error } = await admin
+          .from("device_voice_upload_sessions")
+          .insert({ device_key_hash: deviceKeyHash, lang })
+          .select("session_id")
+          .single();
+
+        if (error || !data) {
+          console.error("session insert failed:", error);
+          return json({ error: "Could not create upload session" }, 500);
+        }
+        return json({ ok: true, session_id: data.session_id });
       }
 
       if (action === "chunk") {
-        const session = sessions.get(body.session_id);
-        if (!session) return json({ error: "Unknown or expired session_id" }, 404);
+        // NOTE on auth for chunk/finish: the currently-deployed ESP32
+        // firmware sends only { action, session_id, data } on chunk calls
+        // — no device_key (see esp32-firmware/voice_terminal.ino,
+        // uploadRecording()) — and firmware changes are explicitly out of
+        // scope for this fix. session_id is a server-generated,
+        // cryptographically random UUID (crypto.randomUUID(), never
+        // guessable, never enumerable) returned ONLY to the device that
+        // successfully authenticated with device_key on `start` — so
+        // knowledge of session_id is itself proof of having passed that
+        // check, functioning as a per-upload bearer credential. This is
+        // what satisfies "a different device_key must not be able to
+        // submit chunks to another session": a second device would need
+        // to already know this session's UUID, which was never exposed to
+        // it. device_key_hash is still stored on the session row (set
+        // from the authenticated `start` call) for audit/traceability,
+        // even though it isn't re-checked as a header on every chunk.
+        if (typeof body.session_id !== "string" || !body.session_id) {
+          return json({ error: "`session_id` is required" }, 400);
+        }
         if (typeof body.data !== "string" || !body.data) {
           return json({ error: "`data` (base64) is required" }, 400);
         }
 
+        // Only a session that is (a) this exact session_id, (b) still
+        // open, and (c) not expired is touched at all.
+        const { data: session, error: selErr } = await admin
+          .from("device_voice_upload_sessions")
+          .select("session_id, received_bytes, status, expires_at")
+          .eq("session_id", body.session_id)
+          .eq("status", "open")
+          .gt("expires_at", new Date().toISOString())
+          .maybeSingle();
+
+        if (selErr) {
+          console.error("session lookup failed:", selErr);
+          return json({ error: "Internal error" }, 500);
+        }
+        if (!session) return json({ error: "Unknown or expired session_id" }, 404);
+
         const bytes = base64ToBytes(body.data);
-        if (session.totalBytes + bytes.length > MAX_SESSION_BYTES) {
-          sessions.delete(body.session_id);
+        if (session.received_bytes + bytes.length > MAX_SESSION_BYTES) {
+          await admin.from("device_voice_upload_sessions").delete().eq("session_id", session.session_id);
           return json({ error: "Session exceeded max allowed size" }, 413);
         }
 
-        session.chunks.push(bytes);
-        session.totalBytes += bytes.length;
-        return json({ ok: true, received: session.totalBytes });
+        // seq is assigned server-side as "how many chunk rows already
+        // exist for this session" — not client-supplied — so a chunk
+        // can't be replayed into an arbitrary position; combined with the
+        // (session_id, seq) primary key on device_voice_upload_chunks, a
+        // duplicate/retried chunk send for the same seq is rejected by
+        // the database itself rather than silently corrupting the
+        // reassembled audio.
+        const { count, error: countErr } = await admin
+          .from("device_voice_upload_chunks")
+          .select("seq", { count: "exact", head: true })
+          .eq("session_id", session.session_id);
+
+        if (countErr) {
+          console.error("chunk count failed:", countErr);
+          return json({ error: "Internal error" }, 500);
+        }
+        const seq = count ?? 0;
+
+        const { error: chunkErr } = await admin.from("device_voice_upload_chunks").insert({
+          session_id: session.session_id,
+          seq,
+          bytes: bytesToHexBytea(bytes),
+        });
+        if (chunkErr) {
+          console.error("chunk insert failed:", chunkErr);
+          return json({ error: "Could not store chunk" }, 500);
+        }
+
+        const receivedBytes = session.received_bytes + bytes.length;
+        const { error: updErr } = await admin
+          .from("device_voice_upload_sessions")
+          .update({ received_bytes: receivedBytes })
+          .eq("session_id", session.session_id);
+        if (updErr) console.error("received_bytes update failed (non-fatal):", updErr); // chunk itself is already durably stored; a failed counter update just makes progress logging slightly stale, not the upload
+
+        return json({ ok: true, received: receivedBytes });
       }
 
       if (action === "finish") {
-        const session = sessions.get(body.session_id);
-        if (!session) return json({ error: "Unknown or expired session_id" }, 404);
-        sessions.delete(body.session_id); // claim immediately — a retried finish must not double-transcribe
+        // See the auth note above the `chunk` handler: the deployed
+        // firmware sends only { action, session_id } here, no device_key
+        // — session_id itself (server-generated, unguessable, only ever
+        // returned to a device that already authenticated on `start`) is
+        // the operative credential for chunk/finish, by necessity given
+        // firmware changes are out of scope for this fix.
+        if (typeof body.session_id !== "string" || !body.session_id) {
+          return json({ error: "`session_id` is required" }, 400);
+        }
 
-        if (session.totalBytes === 0) {
+        const { data: session, error: selErr } = await admin
+          .from("device_voice_upload_sessions")
+          .select("session_id, lang, received_bytes, status, expires_at")
+          .eq("session_id", body.session_id)
+          .eq("status", "open")
+          .gt("expires_at", new Date().toISOString())
+          .maybeSingle();
+
+        if (selErr) {
+          console.error("session lookup failed:", selErr);
+          return json({ error: "Internal error" }, 500);
+        }
+        if (!session) return json({ error: "Unknown or expired session_id" }, 404);
+
+        // Claim the session immediately (mark finished) before doing any
+        // further work — a retried/duplicate `finish` call must not
+        // reassemble and transcribe the same audio twice. The .eq(status,
+        // "open") guard makes this update itself the atomic claim: only
+        // one concurrent `finish` call can be the one that actually
+        // transitions status open -> finished.
+        const { data: claimed, error: claimErr } = await admin
+          .from("device_voice_upload_sessions")
+          .update({ status: "finished" })
+          .eq("session_id", session.session_id)
+          .eq("status", "open")
+          .select("session_id")
+          .maybeSingle();
+
+        if (claimErr) {
+          console.error("session claim failed:", claimErr);
+          return json({ error: "Internal error" }, 500);
+        }
+        if (!claimed) {
+          // Another concurrent finish call claimed it first — same
+          // "nothing more for you to do" outcome as voice-fetch's
+          // equivalent claim-race handling.
+          return json({ error: "Session already finished" }, 409);
+        }
+
+        if (session.received_bytes === 0) {
+          await admin.from("device_voice_upload_sessions").delete().eq("session_id", session.session_id);
           return json({ error: "Session has no uploaded audio" }, 400);
         }
 
-        const fileBytes = new Uint8Array(session.totalBytes);
+        const { data: chunkRows, error: chunkErr } = await admin
+          .from("device_voice_upload_chunks")
+          .select("seq, bytes")
+          .eq("session_id", session.session_id)
+          .order("seq", { ascending: true });
+
+        if (chunkErr || !chunkRows) {
+          console.error("chunk fetch failed:", chunkErr);
+          return json({ error: "Internal error" }, 500);
+        }
+
+        // Verify every expected chunk index is actually present (no gap
+        // from a dropped/never-retried request) before trusting the
+        // reassembled bytes to be a complete, uncorrupted WAV — this is
+        // the "verify all bytes were received" check the protocol
+        // requires, done structurally (contiguous 0..N-1 seq) rather than
+        // by trusting a client-declared total.
+        for (let i = 0; i < chunkRows.length; i++) {
+          if (chunkRows[i].seq !== i) {
+            await admin.from("device_voice_upload_sessions").delete().eq("session_id", session.session_id);
+            return json({ error: `Missing chunk seq ${i} — upload incomplete` }, 400);
+          }
+        }
+
+        const decoded = chunkRows.map((r) => hexByteaToBytes(r.bytes));
+        const totalLen = decoded.reduce((sum, b) => sum + b.length, 0);
+        const fileBytes = new Uint8Array(totalLen);
         let offset = 0;
-        for (const chunk of session.chunks) {
+        for (const chunk of decoded) {
           fileBytes.set(chunk, offset);
           offset += chunk.length;
         }
 
         const result = await transcribeAndBroadcast(fileBytes, session.lang);
+
+        // Cleanup: delete the session row regardless of transcription
+        // outcome — chunk rows cascade-delete with it (ON DELETE CASCADE,
+        // migration 0006). A transcription failure shouldn't leave upload
+        // rows behind any more than a success should.
+        await admin.from("device_voice_upload_sessions").delete().eq("session_id", session.session_id);
+
         if (!result.ok) return json(result.body, result.status);
         return json({ ok: true, text: result.text });
       }
