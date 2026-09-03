@@ -11,3 +11,8 @@ verify_jwt = true
 
 [functions.speak]
 verify_jwt = true
+
+[functions.trigger-mic]
+# ESP32 cannot produce a Supabase user JWT — auth is instead the
+# device_key check inside the function itself (see index.ts).
+verify_jwt = false

@@ -155,6 +155,29 @@ export default function DashboardPage() {
     startSarvamRecording();
   }, [listening, startSarvamRecording, stopSarvamRecording]);
 
+  /* ---------- hardware trigger (ESP32 touch button) ----------
+   * Listens on a Supabase Realtime channel scoped to this user. The
+   * `trigger-mic` Edge Function broadcasts on this same channel name when
+   * the physical button is touched. We just call the SAME startSarvamRecording
+   * used by the on-screen mic button — no separate voice logic.
+   * Ignored while already busy (listening/transcribing/sending) per the
+   * dedup rule in hardware-trigger-architecture.md — a stray or repeated
+   * touch during an active turn does nothing rather than double-triggering.
+   */
+  useEffect(() => {
+    if (!profile?.id) return;
+
+    const channel = supabase.channel(`mic-trigger-${profile.id}`);
+    channel
+      .on("broadcast", { event: "start_mic" }, () => {
+        if (listening || transcribing || sending) return;
+        startSarvamRecording();
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, [profile?.id, listening, transcribing, sending, startSarvamRecording]);
+
   function speakWithBrowser(text: string) {
     if (!("speechSynthesis" in window)) return;
     const u = new SpeechSynthesisUtterance(text);

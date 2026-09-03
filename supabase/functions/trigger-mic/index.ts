@@ -52,7 +52,21 @@ Deno.serve(async (req) => {
     });
 
     const channel = client.channel(`mic-trigger-${TARGET_USER_ID}`);
-    await channel.subscribe();
+
+    // Broadcast requires the channel to have actually joined before send()
+    // is reliable — subscribe() alone doesn't guarantee that by the time
+    // the next line runs, so wait for the SUBSCRIBED callback explicitly.
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("channel join timed out")), 5000);
+      channel.subscribe((status) => {
+        if (status === "SUBSCRIBED") { clearTimeout(timeout); resolve(); }
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          clearTimeout(timeout);
+          reject(new Error(`channel join failed: ${status}`));
+        }
+      });
+    });
+
     await channel.send({
       type: "broadcast",
       event: "start_mic",
