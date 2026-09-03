@@ -1,0 +1,274 @@
+================================================================================
+ SAHAKAR SATHI
+ Multilingual Cooperative Governance & Legal Assistance Chatbot
+================================================================================
+
+ SIH 2026 — Problem Statement 26088
+ Organization : Ministry of Cooperation
+ Department   : National Council for Cooperative Training (NCCT)
+ Theme        : Agriculture, FoodTech & Rural Development
+ Category     : Hardware (Software + Hardware proposed mode)
+
+ Live demo    : https://cglachatbot.netlify.app
+ Repo layout  : see "PROJECT STRUCTURE" below
+
+================================================================================
+ 1. WHAT THIS PROJECT IS
+================================================================================
+
+Cooperative members, farmers and rural stakeholders in India often cannot get
+clear, timely answers about cooperative law, government schemes, PACS (Primary
+Agricultural Credit Society) services, crop insurance, financial products, or
+how to file a grievance — mainly because of language barriers and uneven
+access to reliable guidance.
+
+Sahakar Sathi is an AI assistant that answers these questions directly, in the
+user's own language, by text or voice, grounded in real source documents
+(Acts, by-laws, scheme guidelines) rather than the model's general knowledge
+alone. It is built as a working MVP, not a mockup: every piece described below
+is deployed and has been tested against live services, not stubbed out.
+
+Core capabilities:
+  - Multilingual conversational interface (9 Indian languages + English)
+  - Guidance grounded in cooperative law and by-laws (Retrieval-Augmented
+    Generation over an ingested knowledge base, with citations)
+  - Information on Ministry of Cooperation schemes (PMFBY, KCC, PACS-CSC,
+    Sahakar Mitra, NCDC Yuva Sahakar, etc.)
+  - Financial literacy assistance (Kisan Credit Card, loan basics)
+  - Grievance filing and tracking with auto-generated ticket numbers
+  - Voice input (speech-to-text) and natural-sounding voice output
+    (text-to-speech), both tuned for Indian languages specifically
+  - Per-user language preference (English default, or a chosen default
+    language in "multilingual" mode)
+
+================================================================================
+ 2. HOW IT WORKS (USER JOURNEY)
+================================================================================
+
+1. LOGIN / SIGNUP
+   A user signs up with email + password on a split-screen login page
+   (branding on the left, form on the right). Signup also captures a
+   preferred language. A database trigger automatically creates that user's
+   profile row the moment their auth account is created — the app never has
+   to do this as a separate step.
+
+2. DASHBOARD (chat)
+   The main screen is a chat interface with:
+     - Quick-start suggestion cards (cooperative law, PMFBY, PACS services,
+       financial literacy) for a user who doesn't know what to ask
+     - A scrollable list of ready-reference schemes in the sidebar — tapping
+       one asks the assistant to explain it
+     - A composer with three ways to talk to the assistant: type, or tap the
+       microphone to speak
+     - A language switcher in the header that changes what language the
+       assistant replies in, live
+     - A mute toggle for voice replies
+
+   When the user sends a message:
+     a. The browser calls the "chat" backend function with the question,
+        the user's chosen language, and (if this is a follow-up) the
+        current conversation id.
+     b. The function verifies the user's login token, embeds the question
+        into a vector, and searches the knowledge base for the most
+        relevant passages (semantic search, not keyword search).
+     c. Those passages are handed to the language model as grounding
+        context, along with an instruction to answer ONLY in the user's
+        language, stay concise, avoid inventing facts (section numbers,
+        amounts, deadlines), and say plainly when it is unsure rather than
+        guess.
+     d. The model's answer, plus which source documents it drew from
+        (shown to the user as citation chips), is returned.
+     e. Both the user's question and the assistant's answer are saved to
+        the database, tied to that conversation, so history is preserved.
+     f. The reply is also spoken aloud automatically (unless muted), using
+        natural voice synthesis rather than a robotic system voice.
+
+3. VOICE INPUT
+   Tapping the microphone records audio in the browser, sends it to a
+   speech-to-text function tuned specifically for Indian languages, and
+   fills the composer with the transcribed text — which the user can review
+   or edit before sending, exactly like typed input. If that service is
+   ever unavailable, the browser's own built-in speech recognition takes
+   over automatically and the user is never blocked from using voice.
+
+4. VOICE OUTPUT
+   Every assistant reply is converted to natural speech audio in the same
+   language the reply was given in, and played back automatically. Same
+   safety net as voice input: if the voice service is unavailable, the
+   browser's own text-to-speech steps in instead, so audio never just
+   fails silently.
+
+5. GRIEVANCES
+   A dedicated page lets a user file a structured grievance (category,
+   subject, description) and see a list of everything they've filed, each
+   with an automatically generated ticket number and a status badge (open,
+   in review, escalated, resolved, closed). The "File a grievance" shortcut
+   in the chat sidebar goes straight here.
+
+6. SETTINGS
+   A user can switch between "English only" and "Multilingual" mode (with a
+   default language of their choice), and fill in profile details — name,
+   phone, state, district, PACS name — that could be used to make future
+   answers more locally specific.
+
+7. KNOWLEDGE BASE (admin-only, behind the scenes)
+   An administrator can add new source documents (an Act, a by-law, a
+   scheme circular) through an ingestion function. That function splits
+   the document into paragraph-sized chunks, converts each chunk into a
+   vector embedding, and stores it. From that point on, any user question
+   that's relevant to that document can retrieve it during a chat and cite
+   it. The project ships with five real starter documents already loaded:
+   the Multi-State Cooperative Societies Act (member rights & governance),
+   model PACS by-laws, PMFBY claims and timelines, KCC financial literacy,
+   and the grievance escalation path.
+
+================================================================================
+ 3. ARCHITECTURE
+================================================================================
+
+    Browser (static site, no server to run)
+      |
+      |-- Supabase Auth --------> login/signup, session tokens
+      |-- Supabase Postgres ----> direct reads of the user's own data
+      |                           (profile, conversations, schemes) —
+      |                           protected row-by-row so a user can only
+      |                           ever see their own records
+      |
+      '-- Four backend functions, called over HTTPS:
+            "chat"        -> answers a question (RAG + language model)
+            "ingest"      -> loads a new document into the knowledge base
+            "transcribe"  -> speech-to-text for the microphone
+            "speak"       -> text-to-speech for spoken replies
+
+Why it's built this way:
+  - The frontend is a fully static site — there is no Node.js server to
+    keep running, patch, or scale. It can be hosted anywhere that serves
+    static files (Netlify, in this project's case) essentially for free.
+  - All AI provider API keys (the ones that cost money and must stay
+    secret) live only inside the four backend functions, never in the
+    browser. The browser only ever holds a public, safe-to-expose key
+    that lets it talk to Supabase directly — safe specifically because
+    every table has row-level security turned on, so that key alone
+    cannot read or change another user's data.
+  - The backend functions are small, independent, serverless functions
+    (no server to manage) that scale automatically and only run — and
+    only cost anything — when actually called.
+
+================================================================================
+ 4. TECHNOLOGY STACK
+================================================================================
+
+FRONTEND
+  - Next.js 14 (App Router), compiled to a fully static export — no
+    server-side rendering at runtime, deployable to any static host
+  - React 18 + TypeScript
+  - Tailwind CSS, using the shadcn/ui component approach (button, input,
+    textarea, card, label, badge — hand-built to match shadcn's patterns)
+  - Geist font family (Vercel's typeface) for a clean, modern look
+  - Lucide icon set
+  - A small custom design system: a deep-teal / off-white palette with a
+    matching dark theme, chosen to feel calm and institutional rather than
+    like a generic consumer chat app
+
+BACKEND / INFRASTRUCTURE
+  - Supabase (hosted Postgres + Auth + Edge Functions), region ap-south-1
+  - PostgreSQL 17 with the "pgvector" extension for semantic search
+  - Supabase Auth for email/password login, with automatic profile
+    creation on signup via a database trigger
+  - Row-Level Security (RLS) enforced on every single table — a user's
+    session can only ever see rows that belong to them; reference data
+    (schemes, knowledge-base documents) is readable by any signed-in user
+    but only writable by the backend
+  - Four Supabase Edge Functions (serverless, running on Deno):
+      chat        - retrieval-augmented answer generation
+      ingest      - admin-only knowledge-base document loader
+      transcribe  - speech-to-text
+      speak       - text-to-speech
+
+AI / LANGUAGE MODELS
+  - Google Gemini (gemini-3.6-flash) — generates the assistant's replies
+  - Google Gemini embeddings (gemini-embedding-001, truncated to 768
+    dimensions) — turns both questions and knowledge-base text into
+    vectors for semantic search
+  - Sarvam AI (Saaras v3) — speech-to-text, trained specifically for
+    Indian languages rather than being a general multilingual model;
+    chosen after comparing it against alternatives (including OpenAI
+    Whisper and xAI's speech offering) because it explicitly supports all
+    nine languages this app targets and performs materially better on
+    Indian accents and code-switched speech
+  - Sarvam AI (Bulbul v3) — text-to-speech with natural-sounding Indic
+    voices, replacing the robotic default voice a browser would otherwise
+    use
+
+DATA MODEL (7 tables, all RLS-protected)
+  - profiles       - one row per user: name, phone, language, PACS, role
+  - conversations  - a user's chat sessions
+  - messages       - every turn in every conversation, with citations
+                     stored alongside the answer
+  - kb_documents   - source documents available for retrieval
+  - kb_chunks      - paragraph-level chunks of those documents, each with
+                     a vector embedding, indexed for fast similarity search
+  - grievances     - filed grievances with auto-generated ticket numbers
+                     and a status workflow
+  - schemes        - reference data for known government schemes
+
+DEPLOYMENT
+  - Frontend: Netlify, building the static export directly from source,
+    currently live at https://cglachatbot.netlify.app
+  - Backend: Supabase-hosted (database + auth + all four functions)
+  - No servers to patch, scale, or keep running on either side
+
+================================================================================
+ 5. WHY THESE CHOICES
+================================================================================
+
+  - RAG over a general chatbot: cooperative law and scheme details are
+    exactly the kind of content a language model can get subtly wrong
+    (a section number, an amount, a deadline). Grounding every answer in
+    real ingested documents, and showing which document it came from,
+    is what makes this a credible legal/governance assistant instead of a
+    plausible-sounding generic chatbot.
+
+  - Static frontend + serverless backend: minimises running cost and
+    operational burden, which matters for a scheme meant to eventually
+    serve a large, cost-sensitive user base, and keeps the architecture
+    simple enough for a small team to maintain.
+
+  - Row-Level Security everywhere: security is enforced at the database
+    itself, not just in application code — so even a bug in the frontend
+    can't leak one user's grievance or conversation history to another
+    user.
+
+  - India-specific voice models over general-purpose ones: benchmarks
+    show general multilingual speech models perform substantially worse
+    on Indian languages and accents than models trained specifically for
+    them. Since the target users are explicitly rural, multilingual
+    stakeholders, this difference in quality was treated as a real
+    requirement, not a nice-to-have.
+
+  - Graceful degradation everywhere voice is involved: if either voice
+    service is ever unreachable, the app automatically falls back to the
+    device's own built-in speech recognition/synthesis rather than
+    failing outright — a rural user should never lose functionality
+    because one third-party service had a bad moment.
+
+================================================================================
+ 6. CURRENT STATUS
+================================================================================
+
+  - Full auth, chat, retrieval, grievance, settings, and voice
+    (input + output) flows are built, deployed, and have been verified
+    against the live backend with real requests — not just type-checked.
+  - Five real cooperative-governance documents are loaded into the
+    knowledge base and answering questions correctly with citations.
+  - Live and reachable at https://cglachatbot.netlify.app.
+
+  Not yet built (future scope, not required for the current MVP):
+    - Conversation history sidebar (resuming a past conversation)
+    - Dark mode toggle (the theme already supports it, just not exposed)
+    - Streaming replies (answers currently arrive all at once)
+    - Offline/PWA support for low-connectivity rural use
+    - Letting the assistant file a grievance conversationally, rather
+      than only through the dedicated form
+
+================================================================================

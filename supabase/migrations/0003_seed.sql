@@ -1,0 +1,28 @@
+-- Migration 0003: seed reference data (schemes)
+insert into public.schemes (code, name, summary, benefits, eligibility, apply_url, category) values
+('PMFBY','Pradhan Mantri Fasal Bima Yojana',
+ 'Crop insurance scheme providing financial support to farmers suffering crop loss or damage due to unforeseen events.',
+ 'Low premium: 2% (Kharif), 1.5% (Rabi), 5% (commercial/horticultural). Full sum insured on notified crop loss.',
+ 'All farmers growing notified crops in notified areas, including sharecroppers and tenant farmers.',
+ 'https://pmfby.gov.in','pmfby'),
+('SAHAKAR-M','Sahakar Mitra Internship',
+ 'Internship programme giving young professionals hands-on exposure to cooperative institutions.',
+ 'Stipend support and structured mentorship across cooperative bodies.',
+ 'Professional graduates in agriculture, cooperation, finance, IT and allied disciplines.',
+ 'https://www.ncdc.in','ministry_scheme'),
+('PACS-CSC','PACS as Common Service Centres',
+ 'Enables Primary Agricultural Credit Societies to deliver 300+ e-services at the village level.',
+ 'Banking, insurance, Aadhaar, utility and government services delivered locally.',
+ 'Functional PACS registered under state cooperative societies acts.',
+ 'https://www.cooperation.gov.in','pacs_service'),
+('NCDC-YUVA','NCDC Yuva Sahakar',
+ 'Cooperative enterprise support scheme encouraging youth-led cooperative ventures.',
+ 'Concessional funding, extended repayment tenure and higher project cost coverage.',
+ 'Cooperatives registered under applicable state or central cooperative acts.',
+ 'https://www.ncdc.in','ministry_scheme'),
+('KCC','Kisan Credit Card',
+ 'Provides farmers timely and adequate short-term credit for cultivation and allied needs.',
+ 'Short-term crop loans at concessional interest with interest subvention on prompt repayment.',
+ 'Farmers, tenant farmers, oral lessees, sharecroppers and SHG/JLG members.',
+ 'https://www.myscheme.gov.in','financial_literacy')
+on conflict (code) do nothing;
