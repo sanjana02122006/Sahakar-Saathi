@@ -1264,16 +1264,41 @@ bool streamPlayResponse(HTTPClient &http) {
   i2sConfigureTx(info.sampleRate, info.bitsPerSample, info.numChannels);
 
   // ---- steady-state: fill from network, drain to I2S, interleaved ----
+  //
+  // Diagnostic instrumentation added after a real-hardware stall report:
+  // pre-buffer (16594 bytes, ~0.5s of audio) succeeded, I2S was
+  // configured, playback started, then BOTH sides reported zero progress
+  // for a full 15s -- with no visibility into which side (network fill,
+  // I2S drain, or something in between) actually stopped making progress
+  // first, or why. The single shared lastAnyProgress timestamp made it
+  // impossible to tell "network stopped delivering" apart from "I2S
+  // stopped draining" apart from "both were fine but the loop itself
+  // never reached them". This rewrite tracks network and I2S progress
+  // SEPARATELY, logs a distinct state on every iteration where nothing
+  // happened (rate-limited to avoid flooding Serial), and logs whichever
+  // specific condition actually trips the stall timeout -- so the next
+  // real-hardware run pinpoints the failure instead of restating that one
+  // occurred.
   const size_t I2S_CHUNK = 512;
   uint8_t i2sChunk[I2S_CHUNK];
   bool streamEnded = false;
   bool playbackError = false;
-  unsigned long lastAnyProgress = millis();
+  unsigned long lastNetworkProgress = millis();
+  unsigned long lastI2sProgress = millis();
+  uint32_t totalNetworkBytes = rb.count; // pre-buffer already counted
+  uint32_t totalI2sBytes = 0;
+  unsigned long lastStatusLog = millis();
+  const unsigned long STATUS_LOG_INTERVAL_MS = 1000; // rate-limited per explicit instruction -- not per byte, not per iteration
 
   while (true) {
+    unsigned long loopNow = millis();
+    const char *fillState = "SKIPPED_STREAM_ENDED";
+    const char *drainState = "SKIPPED_EMPTY";
+
     // Fill: pull whatever is available from the network into the ring
     // buffer without blocking, bounded by remaining ring capacity.
     if (!streamEnded) {
+      bool stillConnected = rawStream->connected();
       int availableNow = rawStream->available();
       if (availableNow > 0) {
         size_t room = ringFree(rb);
@@ -1283,11 +1308,25 @@ bool streamPlayResponse(HTTPClient &http) {
           int n = rawStream->readBytes(netChunk, want);
           if (n > 0) {
             ringWrite(rb, netChunk, n);
-            lastAnyProgress = millis();
+            lastNetworkProgress = loopNow;
+            totalNetworkBytes += n;
+            fillState = "NETWORK_READ";
+          } else {
+            // available() reported >0 but readBytes() returned 0 -- a
+            // real, distinguishable condition (per the requirement not
+            // to treat every zero-progress case the same way): the
+            // socket claimed data was ready but the read itself produced
+            // nothing this call.
+            fillState = "NETWORK_READ_ZERO";
           }
+        } else {
+          fillState = "BUFFER_FULL"; // network has data, but the ring buffer has no room -- I2S drain is the bottleneck, not the network
         }
-      } else if (!rawStream->connected()) {
+      } else if (!stillConnected) {
         streamEnded = true; // connection closed -- this is the authoritative end-of-audio signal, not the WAV header's dataSize field
+        fillState = "TCP_DISCONNECTED";
+      } else {
+        fillState = "NETWORK_WAIT"; // still connected, simply nothing available from the socket THIS iteration -- normal and expected between TCP segments, not itself an error
       }
     }
 
@@ -1301,18 +1340,49 @@ bool streamPlayResponse(HTTPClient &http) {
       size_t n = ringRead(rb, i2sChunk, I2S_CHUNK);
       if (!i2sWriteAllRetry(i2sChunk, n)) {
         playbackError = true;
+        drainState = "I2S_WRITE_ERROR";
+        Serial.printf("[STREAM] state=%s netBytes=%u i2sBytes=%u ringCount=%u ringCap=%u connected=%d\n",
+                      drainState, (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes, (unsigned)rb.count, (unsigned)rb.capacity, (int)rawStream->connected());
         break;
       }
-      lastAnyProgress = millis();
+      lastI2sProgress = loopNow;
+      totalI2sBytes += n;
+      drainState = "I2S_WRITE";
     } else if (streamEnded) {
+      Serial.printf("[STREAM] state=END_OF_STREAM netBytes=%u i2sBytes=%u\n", (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes);
       break; // buffer empty AND network stream is done -- playback complete
+    } else {
+      drainState = "BUFFER_EMPTY"; // nothing queued for I2S yet -- normal while waiting on the network to fill it, not itself an error
     }
 
-    if (millis() - lastAnyProgress > 15000) {
-      // Neither side made progress for 15s -- a genuine stall (network
-      // and buffer both idle), not the ordinary case of I2S draining
-      // faster than the network can fill.
-      Serial.println("[PLAYBACK_ERROR] streaming stalled (no network or I2S progress).");
+    // Rate-limited status line -- every ~1s, not every iteration/byte,
+    // per the explicit requirement. Reports exactly the fields asked
+    // for: ring capacity, current buffered bytes, cumulative bytes moved
+    // each direction, both progress timestamps (as "ms since"), and live
+    // connection state.
+    if (loopNow - lastStatusLog >= STATUS_LOG_INTERVAL_MS) {
+      Serial.printf("[STREAM] fill=%s drain=%s ringCount=%u/%u netBytes=%u i2sBytes=%u sinceNet=%lums sinceI2s=%lums connected=%d\n",
+                    fillState, drainState, (unsigned)rb.count, (unsigned)rb.capacity,
+                    (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes,
+                    loopNow - lastNetworkProgress, loopNow - lastI2sProgress,
+                    (int)rawStream->connected());
+      lastStatusLog = loopNow;
+    }
+
+    // Stall detection: only fires when NEITHER side has made real
+    // progress in 15s. Logs which specific side(s) are stuck so a stall
+    // caused by "network genuinely has nothing new" reads differently
+    // from "I2S stopped accepting writes" -- collapsing both into one
+    // generic message (the previous version) is exactly what made this
+    // report undiagnosable from the log alone.
+    bool networkStalled = (loopNow - lastNetworkProgress) > 15000;
+    bool i2sStalled = (loopNow - lastI2sProgress) > 15000;
+    if (networkStalled && i2sStalled) {
+      Serial.printf("[PLAYBACK_ERROR] STALL_TIMEOUT: network idle %lums, I2S idle %lums, ringCount=%u/%u, netBytes=%u, i2sBytes=%u, tcpConnected=%d\n",
+                    loopNow - lastNetworkProgress, loopNow - lastI2sProgress,
+                    (unsigned)rb.count, (unsigned)rb.capacity,
+                    (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes,
+                    (int)rawStream->connected());
       playbackError = true;
       break;
     }
