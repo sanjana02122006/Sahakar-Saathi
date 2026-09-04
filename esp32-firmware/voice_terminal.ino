@@ -1416,6 +1416,38 @@ bool streamPlayResponse(HTTPClient &http) {
       }
     }
 
+    // ---- Content-Length-based completion check ----
+    // Real-hardware result: netBytes reached expectedBytes exactly
+    // (702806 == 702806) and every byte was drained to I2S
+    // (i2sBytes == netBytes, ringCount == 0) -- yet the loop kept running
+    // and eventually hit STALL_TIMEOUT, because the only completion path
+    // was `else if (streamEnded)` below, and streamEnded is ONLY ever set
+    // by an actual TCP disconnect (fillState == TCP_DISCONNECTED, a few
+    // lines up). voice-fetch's connection can stay open/keep-alive after
+    // the full body has already been delivered -- there is no requirement
+    // that the server close the socket just because this was its only
+    // response on it, and per the explicit instruction, this firmware
+    // must not wait for that to happen. Content-Length (expectedBytes,
+    // added in 76da09e) is the authoritative signal for "the body is
+    // fully received"; it does not need TCP-level confirmation on top of
+    // that. This check is evaluated every iteration, independent of
+    // streamEnded, and completes playback the instant all three
+    // conditions are simultaneously true: the full expected byte count
+    // has arrived from the network, every one of those bytes has already
+    // been drained out through I2S, and the ring buffer is empty (so
+    // there is nothing left in flight that this check could be
+    // prematurely cutting off).
+    if (!playbackError && expectedBytes > 0 &&
+        (long)totalNetworkBytes >= expectedBytes &&
+        (long)totalI2sBytes >= expectedBytes &&
+        rb.count == 0) {
+      Serial.println("[PLAY] HTTP body fully consumed");
+      Serial.println("[PLAY] All audio drained to I2S");
+      Serial.printf("[PLAY] Streaming playback complete (netBytes=%u i2sBytes=%u expectedBytes=%ld)\n",
+                    (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes, expectedBytes);
+      break; // success -- falls through to the existing silence-pad + i2sTeardown() below, same as any other clean completion
+    }
+
     // Drain: hand off one I2S-sized chunk from the ring buffer, if any
     // is available.
     if (rb.count > 0) {
