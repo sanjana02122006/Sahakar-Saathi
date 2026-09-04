@@ -1211,6 +1211,17 @@ static bool i2sWriteAllRetry(const uint8_t *data, size_t len) {
 // leaves I2S torn down) on any error -- per the requirement, corrupted
 // or incomplete data is never played.
 bool streamPlayResponse(HTTPClient &http) {
+  // Content-Length, as HTTPClient itself parsed it from the response
+  // headers -- confirmed live against the real voice-fetch endpoint (a
+  // curl request for the same-sized WAV that triggered a real-hardware
+  // stall received the FULL body correctly, with a matching
+  // Content-Length header, ruling out the backend sending a short body).
+  // Logged here explicitly so a stall's Serial output shows the
+  // authoritative expected total right next to how many bytes actually
+  // arrived, rather than requiring a second test to establish it.
+  int contentLength = http.getSize();
+  Serial.printf("[STREAM] Content-Length: %d\n", contentLength);
+
   WiFiClient *rawStream = http.getStreamPtr();
   if (!rawStream) {
     Serial.println("[PLAYBACK_ERROR] no response stream available.");
@@ -1224,6 +1235,16 @@ bool streamPlayResponse(HTTPClient &http) {
     return false;
   }
   Serial.println("[PLAY] WAV header parsed, starting streaming playback");
+
+  // expectedBytes is the audio PAYLOAD portion of the body only (the WAV
+  // header bytes parseWavHeaderStream() just consumed are not part of
+  // what streamPlayResponse()'s own network-read counters track below).
+  // Falls back to the WAV header's own dataSize field if Content-Length
+  // wasn't available for some reason, so this diagnostic still has a
+  // number to compare against either way.
+  long expectedBytes = (contentLength > 0) ? (long)contentLength - 44 : (long)info.dataSize;
+  Serial.printf("[STREAM] expected body bytes: %ld (Content-Length=%d, dataSize hint=%u)\n",
+                expectedBytes, contentLength, (unsigned)info.dataSize);
 
   if (info.numChannels >= 2) {
     Serial.println("Note: stereo WAV — playing as interleaved stereo via I2S_CHANNEL_FMT_RIGHT_LEFT, no downmix needed.");
@@ -1349,8 +1370,19 @@ bool streamPlayResponse(HTTPClient &http) {
       totalI2sBytes += n;
       drainState = "I2S_WRITE";
     } else if (streamEnded) {
-      Serial.printf("[STREAM] state=END_OF_STREAM netBytes=%u i2sBytes=%u\n", (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes);
-      break; // buffer empty AND network stream is done -- playback complete
+      // Per the explicit requirement: the response is only genuinely
+      // complete if the bytes actually received match what Content-Length
+      // promised. A TCP disconnect after fewer bytes than expected is a
+      // TRUNCATED response, not a normal completion -- logged distinctly
+      // here (SHORT vs COMPLETE) so this is provable from the Serial
+      // output rather than inferred.
+      long remainingExpectedBytes = expectedBytes - (long)totalNetworkBytes;
+      bool wasShort = (expectedBytes > 0) && (remainingExpectedBytes > 0);
+      Serial.printf("[STREAM] state=END_OF_STREAM (%s) netBytes=%u i2sBytes=%u expectedBytes=%ld remainingExpectedBytes=%ld\n",
+                    wasShort ? "SHORT" : "COMPLETE",
+                    (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes, expectedBytes, remainingExpectedBytes);
+      if (wasShort) playbackError = true; // per the requirement -- do not treat an early TCP close as a valid completion when bytes are still missing
+      break; // buffer empty AND network stream is done -- playback complete (or truncated, per the flag above)
     } else {
       drainState = "BUFFER_EMPTY"; // nothing queued for I2S yet -- normal while waiting on the network to fill it, not itself an error
     }
@@ -1361,9 +1393,10 @@ bool streamPlayResponse(HTTPClient &http) {
     // each direction, both progress timestamps (as "ms since"), and live
     // connection state.
     if (loopNow - lastStatusLog >= STATUS_LOG_INTERVAL_MS) {
-      Serial.printf("[STREAM] fill=%s drain=%s ringCount=%u/%u netBytes=%u i2sBytes=%u sinceNet=%lums sinceI2s=%lums connected=%d\n",
+      Serial.printf("[STREAM] fill=%s drain=%s ringCount=%u/%u netBytes=%u i2sBytes=%u remainingExpected=%ld sinceNet=%lums sinceI2s=%lums connected=%d\n",
                     fillState, drainState, (unsigned)rb.count, (unsigned)rb.capacity,
                     (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes,
+                    expectedBytes - (long)totalNetworkBytes,
                     loopNow - lastNetworkProgress, loopNow - lastI2sProgress,
                     (int)rawStream->connected());
       lastStatusLog = loopNow;
@@ -1378,10 +1411,11 @@ bool streamPlayResponse(HTTPClient &http) {
     bool networkStalled = (loopNow - lastNetworkProgress) > 15000;
     bool i2sStalled = (loopNow - lastI2sProgress) > 15000;
     if (networkStalled && i2sStalled) {
-      Serial.printf("[PLAYBACK_ERROR] STALL_TIMEOUT: network idle %lums, I2S idle %lums, ringCount=%u/%u, netBytes=%u, i2sBytes=%u, tcpConnected=%d\n",
+      Serial.printf("[PLAYBACK_ERROR] STALL_TIMEOUT: network idle %lums, I2S idle %lums, ringCount=%u/%u, netBytes=%u, i2sBytes=%u, expectedBytes=%ld, remainingExpectedBytes=%ld, tcpConnected=%d\n",
                     loopNow - lastNetworkProgress, loopNow - lastI2sProgress,
                     (unsigned)rb.count, (unsigned)rb.capacity,
                     (unsigned)totalNetworkBytes, (unsigned)totalI2sBytes,
+                    expectedBytes, expectedBytes - (long)totalNetworkBytes,
                     (int)rawStream->connected());
       playbackError = true;
       break;
