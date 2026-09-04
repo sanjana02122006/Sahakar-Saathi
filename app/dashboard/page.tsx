@@ -329,71 +329,6 @@ export default function DashboardPage() {
     }
   }
 
-  // Final-response length cap for the voice terminal prototype: ONE AI
-  // request only, no summarization, no second model call. If the reply
-  // exceeds the limit, the reply text itself is truncated at a sentence
-  // boundary and that truncated text becomes THE final response —
-  // displayed in the browser AND spoken by the ESP32, identically. This
-  // replaced an earlier ESP32-only trim (which left the browser's copy
-  // full-length); the truncation now happens once, in send() below,
-  // before the reply is ever committed to chat state or handed to
-  // speak(), so there is exactly one response object for the rest of
-  // this component to work with, not two.
-  const MAX_RESPONSE_WORDS = 80;
-
-  function truncateFinalResponse(text: string): string {
-    const trimmed = text.trim();
-    const words = trimmed.split(/\s+/);
-    if (words.length <= MAX_RESPONSE_WORDS) return trimmed; // already within limit -- left unchanged, per spec
-
-    // Walk sentence-ending punctuation (., !, ?, and the Devanagari
-    // danda । used by Hindi/Marathi) and keep every complete sentence
-    // whose cumulative word count is still within the limit. This finds
-    // the boundary by word count (not character count), matching the
-    // "60-80 words AND no more than 3-4 sentences" requirement directly,
-    // rather than approximating word count from a character slice.
-    //
-    // sentenceRegex.match() returns null (not a one-element array holding
-    // the whole string) when the text has NO terminal punctuation
-    // anywhere -- that null case must fall through to the hard word-count
-    // cut below, not be treated as "one giant sentence that fits". Two
-    // related bugs an earlier version of this function got wrong, both
-    // now guarded explicitly:
-    //   1. An unpunctuated block over the word limit (sentences === null)
-    //      must not be kept whole.
-    //   2. A SINGLE sentence that by itself already exceeds the word
-    //      limit (e.g. one 150-word run-on sentence with punctuation only
-    //      at the very end) must also not be kept whole -- the guard
-    //      below is unconditional (not gated on wordCount > 0 first),
-    //      specifically so the very first sentence is checked against the
-    //      limit too, not just sentences after it.
-    const sentenceRegex = /[^.!?।]+[.!?।]+[\s]*/g;
-    const sentences = trimmed.match(sentenceRegex);
-    let result = "";
-    if (sentences) {
-      let wordCount = 0;
-      for (const sentence of sentences) {
-        const sentenceWords = sentence.trim().split(/\s+/).length;
-        if (wordCount + sentenceWords > MAX_RESPONSE_WORDS) break; // adding this sentence (even as the very first one) would exceed the limit -- stop before it
-        result += sentence;
-        wordCount += sentenceWords;
-        if (wordCount >= MAX_RESPONSE_WORDS) break; // hit the target exactly -- stop here rather than adding a 4th+ sentence unnecessarily
-      }
-      result = result.trim();
-    }
-
-    // No usable sentence boundary was found within the limit (either no
-    // terminal punctuation at all, or the very first sentence alone
-    // already exceeds MAX_RESPONSE_WORDS) -- fall back to a hard
-    // word-count cut rather than returning the entire original text
-    // unclipped, since silently ignoring the limit would defeat the whole
-    // point of this function.
-    if (!result) {
-      result = words.slice(0, MAX_RESPONSE_WORDS).join(" ") + "…";
-    }
-    return result;
-  }
-
   // Generates the TTS clip via the SAME `speak` Edge Function used for
   // browser playback, but only ever queues it for the ESP32 — never
   // plays it locally. Kept as its own function (rather than inlined into
@@ -486,11 +421,12 @@ export default function DashboardPage() {
       if (data.conversation_id) setConversationId(data.conversation_id);
 
       // ONE AI request only (the fetch to `chat` above) -- no second
-      // model call, no summarization call. finalReply is computed here,
-      // once, from that single response, and is the ONE value used for
-      // both display and speech below -- not two separately-derived
-      // texts.
-      const finalReply = truncateFinalResponse(data.reply ?? "");
+      // model call, no summarization call, no client-side truncation.
+      // Response length is controlled entirely by the prompt instruction
+      // in supabase/functions/chat/index.ts (systemPrompt). finalReply is
+      // the ONE value used for both display and speech below -- not two
+      // separately-derived texts.
+      const finalReply = (data.reply ?? "").trim();
 
       const reply: Message = {
         id: crypto.randomUUID(), conversation_id: data.conversation_id ?? "", role: "assistant",
