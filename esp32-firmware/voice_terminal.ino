@@ -27,24 +27,30 @@
         see the transcript) -> on HTTP 200, /recording.wav is DELETED
         (it's already durably uploaded, never read back locally) ->
         POLLING voice-fetch for the TTS reply
-     -> PLAYING: response WAV downloaded to LittleFS (space-checked
-        against free bytes before writing, every write's return value
-        checked, short/failed downloads discarded rather than played),
-        its RIFF/fmt/data header validated then parsed at runtime (see
-        validateWavFile/parseWavHeader) rather than assuming a fixed
-        format, streamed PCM->I2S TX, then /response.wav is DELETED
-        whether playback succeeded or failed -> IDLE.
+     -> PLAYING: response WAV is STREAMED, never written to LittleFS.
+        Its RIFF/fmt/data header is parsed directly off the live HTTPS
+        body (parseWavHeaderStream) rather than assuming a fixed format,
+        audio bytes flow network -> a small RAM ring buffer
+        (AUDIO_RINGBUF_BYTES) -> I2S TX (streamPlayResponse), with a
+        short pre-buffer before I2S starts so a brief network stall
+        doesn't immediately underrun playback. This removes the earlier
+        LittleFS-space ceiling on reply length entirely — a long AI
+        response's synthesized audio no longer needs to fit in the
+        device's flash at all, only in the ring buffer's short rolling
+        window -> IDLE.
         No MP3 decoder — the backend's speak() now requests Sarvam's
         "wav"/PCM codec instead of MP3, so the bytes voice-fetch returns
         are already playable PCM once past the WAV header.
 
-   LittleFS lifecycle (the actual fix for a "No more free space" error
-   seen in testing): at most ONE large WAV file exists on the filesystem
-   at any moment. /recording.wav is removed immediately after a
-   confirmed-successful upload, BEFORE polling/downloading the reply
-   begins — previously it was left in place, so a ~1.4MB recording plus
-   an incoming ~1.4MB response together exceeded the partition's
-   capacity and produced a truncated, unparseable response.wav.
+   LittleFS is used ONLY for /recording.wav now (the mic side, streamed
+   to flash during recording since that side's duration is bounded by
+   MAX_RECORD_SECONDS and needs to survive the upload's own retry path).
+   /recording.wav is removed immediately after a confirmed-successful
+   upload, before polling begins — this was the fix for an earlier
+   "No more free space" bug where a lingering recording.wav plus a
+   downloaded response.wav together exceeded the partition; that whole
+   class of problem no longer applies to the response side at all now
+   that it's never written to flash.
 
    A new touch while BUSY (anything other than IDLE) is ignored — see
    the state machine below. This is deliberate: half-duplex push-to-talk
@@ -103,7 +109,9 @@ static const char *UPLOAD_LANG = "en-IN";
 #define NUM_CHANNELS     1      // mono
 
 static const char *RECORDING_PATH = "/recording.wav";
-static const char *RESPONSE_PATH  = "/response.wav";
+// No RESPONSE_PATH: response playback is streamed directly from the
+// network into a RAM ring buffer and out to I2S -- never written to
+// LittleFS at all. See streamPlayResponse() below.
 
 // Safety cap so a stuck touch can't fill the filesystem — 30s at
 // 16kHz/16-bit/mono is ~960KB, comfortably inside typical LittleFS
@@ -125,7 +133,27 @@ static const char *RESPONSE_PATH  = "/response.wav";
 
 // TTS polling
 #define POLL_INTERVAL_MS 500
-#define POLL_TIMEOUT_MS  30000
+// A long AI reply (200+ words) takes longer to synthesize server-side
+// (Gemini generation + a single Sarvam TTS call over the whole reply)
+// before voice-output ever queues anything for voice-fetch to return.
+// 30s was tight enough to time out on long replies even though the
+// pipeline was still going to succeed a few seconds later -- raised to
+// 120s so the device doesn't give up on a slow-but-healthy turn.
+#define POLL_TIMEOUT_MS  120000
+
+// Streaming playback ring buffer. 32KB chosen conservatively: real
+// hardware logs from this project's own upload path (ESP.getFreeHeap(),
+// logged during active WiFiClientSecure/TLS use) showed 180-190KB free
+// heap with TLS already active, so 32KB leaves comfortable headroom
+// rather than targeting the riskier 64KB end of the suggested range.
+#define AUDIO_RINGBUF_BYTES (32 * 1024)
+// Pre-buffer this many bytes before starting I2S playback, so a short
+// network stall right after playback starts doesn't immediately
+// underrun. ~1s of audio at the confirmed 16kHz/16-bit/mono format this
+// project's speak() produces (32000 bytes/s), capped below the ring
+// buffer's own size so pre-buffering can never itself deadlock waiting
+// for more room than the buffer could ever hold.
+#define AUDIO_PREBUFFER_BYTES (16 * 1024)
 
 // ============================================================
 // ---- State machine ----
@@ -187,10 +215,9 @@ void patchWavHeader(File &f, uint32_t dataBytes);
 bool uploadRecording();
 bool pollAndPlayResponse();
 
-struct WavInfo; // full definition below, near parseWavHeader/playWavFile
-bool parseWavHeader(File &f, WavInfo &info);
-bool validateWavFile(const String &path);
-bool playWavFile(const String &path);
+struct WavInfo; // full definition below, near parseWavHeaderStream/streamPlayResponse
+struct RingBuffer; // full definition below, near streamPlayResponse
+bool streamPlayResponse(HTTPClient &http);
 
 // ============================================================
 // setup / loop
@@ -900,112 +927,8 @@ bool pollAndPlayResponse() {
 
     if (code == 200) {
       Serial.println("[POLL] Response received");
-      WiFiClient *stream = http.getStreamPtr();
-      int len = http.getSize(); // Content-Length; -1 if the server didn't send one
-
-      // ---- FIX 1: always start from a clean slate ----
-      if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
-
-      // ---- FIX 2: verify there is room BEFORE writing anything ----
-      // Leave headroom rather than racing the exact free-byte count —
-      // LittleFS itself has bookkeeping/metadata overhead per write, so
-      // "free bytes == payload bytes" is not actually safe.
-      const uint32_t FS_HEADROOM_BYTES = 8192;
-      uint32_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
-      if (len > 0 && (uint32_t)len + FS_HEADROOM_BYTES > freeBytes) {
-        Serial.printf("[PLAYBACK_ERROR] Not enough LittleFS space for response WAV (need ~%d + %u headroom, have %u free)\n",
-                      len, FS_HEADROOM_BYTES, freeBytes);
-        http.end();
-        return false;
-      }
-      if (len <= 0) {
-        // Server didn't send Content-Length (chunked, or omitted) — can't
-        // pre-check exact size, but can still refuse to even start if
-        // free space is already critically low.
-        Serial.printf("[FS] Content-Length unknown; free space check limited to current headroom (%u bytes free)\n", freeBytes);
-        if (freeBytes < FS_HEADROOM_BYTES) {
-          Serial.println("[PLAYBACK_ERROR] Not enough LittleFS space for response WAV");
-          http.end();
-          return false;
-        }
-      } else {
-        Serial.printf("[FS] Enough space for response (%d bytes needed, %u free)\n", len, freeBytes);
-      }
-
-      File out = LittleFS.open(RESPONSE_PATH, FILE_WRITE);
-      if (!out) {
-        Serial.println("[PLAYBACK_ERROR] could not open response file for write.");
-        http.end();
-        return false;
-      }
-
-      // ---- FIX 3: track expected/received/written bytes, verify every write ----
-      uint8_t buf[512];
-      uint32_t received = 0;   // bytes read from the network
-      uint32_t writtenOk = 0;  // bytes CONFIRMED written to LittleFS (write() return value, not just requested)
-      bool writeFailed = false;
-      unsigned long dlStart = millis();
-
-      while (http.connected() && (len < 0 || (int)received < len)) {
-        size_t avail = stream->available();
-        if (avail) {
-          int n = stream->readBytes(buf, min((size_t)sizeof(buf), avail));
-          received += n;
-
-          size_t w = out.write(buf, n);
-          if (w != (size_t)n) {
-            // Do NOT assume out.write(buf, n) wrote all n bytes — per the
-            // requirement, check the actual return value every time.
-            Serial.printf("[PLAYBACK_ERROR] LittleFS write failed (requested %d, wrote %u)\n", n, (unsigned)w);
-            writeFailed = true;
-            break;
-          }
-          writtenOk += w;
-          dlStart = millis(); // reset stall timer on real progress
-        } else if ((millis() - dlStart) > 30000) {
-          Serial.println("[PLAYBACK_ERROR] download stalled, aborting.");
-          writeFailed = true;
-          break;
-        }
-        delay(1);
-      }
-      out.close();
+      bool played = streamPlayResponse(http);
       http.end();
-
-      // A short read (connection closed before `len` bytes arrived) is the
-      // same class of problem as a failed write: an incomplete file must
-      // not be handed to the WAV parser/playback path.
-      bool shortRead = (len > 0 && (int)received < len);
-
-      if (writeFailed || shortRead) {
-        Serial.printf("[PLAYBACK_ERROR] Response WAV incomplete (expected=%d received=%u written=%u)\n",
-                      len, received, writtenOk);
-        Serial.println("[PLAYBACK_ERROR] Response WAV discarded");
-        if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
-        return false;
-      }
-
-      Serial.printf("Downloaded %u bytes to %s\n", writtenOk, RESPONSE_PATH);
-
-      // ---- FIX 4: validate the WAV header BEFORE attempting playback ----
-      if (!validateWavFile(RESPONSE_PATH)) {
-        if (LittleFS.exists(RESPONSE_PATH)) LittleFS.remove(RESPONSE_PATH);
-        return false;
-      }
-      Serial.println("[PLAY] WAV validated");
-
-      bool played = playWavFile(RESPONSE_PATH);
-      if (!played) {
-        Serial.println("[PLAYBACK_ERROR] WAV parse/playback failed.");
-      }
-
-      // ---- Always delete response.wav after we're done with it, win or lose ----
-      if (LittleFS.exists(RESPONSE_PATH)) {
-        LittleFS.remove(RESPONSE_PATH);
-        Serial.println("[FS] response.wav deleted");
-      }
-      Serial.printf("[FS] Free space: %u / %u bytes\n", (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()), (unsigned)LittleFS.totalBytes());
-
       return played;
     }
 
@@ -1022,96 +945,208 @@ bool pollAndPlayResponse() {
 }
 
 // ============================================================
-// WAV parsing (small, hand-rolled — no audio library)
+// Streaming WAV playback: network -> RAM ring buffer -> I2S
 // ============================================================
 //
-// Backend context: as of this project's MP3->WAV switch, speak() (see
-// supabase/functions/speak/index.ts) requests Sarvam's "wav" codec at
-// speech_sample_rate=16000, which a live test against the deployed
-// function confirmed produces a standard PCM WAV: RIFF/WAVE, mono,
-// 16000Hz, 16-bit. That confirmed value is NOT hardcoded here, though —
-// Sarvam does not echo the sample rate back in any response field this
-// project's code inspects, and the point of parsing the header at all is
-// to not assume it holds. If speak() is ever retuned to a different
-// rate/channel count, this parser adapts without a firmware change.
+// Replaces the previous design (download the whole response to
+// /response.wav on LittleFS, close it, reopen it, play it). That design
+// capped every reply at whatever free LittleFS space remained (observed
+// on real hardware: a long reply's ~2MB WAV exceeded the ~1.4MB free
+// partition and was correctly refused rather than corrupted -- but that
+// refusal is itself the problem this replaces). Streaming removes the
+// cap entirely: audio is played as it arrives over HTTPS, a small
+// (AUDIO_RINGBUF_BYTES) RAM buffer sits between the network and I2S, and
+// the response is never written to flash at all. RESPONSE_PATH,
+// validateWavFile(), playWavFile(), and the File-based parseWavHeader()
+// are removed as obsolete -- nothing else in this firmware ever wrote to
+// or read RESPONSE_PATH except the code this replaces.
+//
+// Backend contract (unchanged): speak() (supabase/functions/speak/
+// index.ts) requests Sarvam's "wav" codec at speech_sample_rate=16000 --
+// confirmed live earlier in this project against the deployed function.
+// The sample rate/bit depth/channel count are still parsed from the
+// actual WAV header rather than assumed, exactly as before -- this
+// firmware still adapts if speak() is ever retuned.
 
 struct WavInfo {
   uint16_t audioFormat;
   uint16_t numChannels;
   uint32_t sampleRate;
   uint16_t bitsPerSample;
-  uint32_t dataSize;
-  uint32_t dataOffset; // byte offset into the file where PCM samples begin
+  uint32_t dataSize;     // from the WAV header -- a hint for logging/UX, not trusted as the sole end-of-audio signal (see streamPlayResponse)
 };
 
-static uint16_t readLE16(File &f) {
+// Simple fixed-size ring buffer, no dynamic allocation (avoids heap
+// fragmentation risk from repeated malloc/free across many playback
+// cycles over the device's lifetime). Single-producer (network fill),
+// single-consumer (I2S drain), both driven from the same single-threaded
+// call site in streamPlayResponse() below -- no concurrent access, so no
+// locking is needed despite this looking superficially like a
+// producer/consumer structure.
+struct RingBuffer {
+  uint8_t *data;
+  size_t capacity;
+  volatile size_t head; // next write position
+  volatile size_t tail; // next read position
+  volatile size_t count; // bytes currently held -- kept explicit rather than derived from head/tail so "full" and "empty" (both head==tail) are unambiguous
+};
+
+static void ringInit(RingBuffer &rb, uint8_t *buf, size_t capacity) {
+  rb.data = buf;
+  rb.capacity = capacity;
+  rb.head = 0;
+  rb.tail = 0;
+  rb.count = 0;
+}
+
+static size_t ringFree(RingBuffer &rb) {
+  return rb.capacity - rb.count;
+}
+
+// Copies up to `len` bytes from `src` into the ring buffer, wrapping as
+// needed. Returns the number actually copied (<= ringFree()) -- caller
+// must check this against what it intended to write, same
+// verify-every-write discipline used for network writes in
+// writeAllRetry() above.
+static size_t ringWrite(RingBuffer &rb, const uint8_t *src, size_t len) {
+  size_t toWrite = min(len, ringFree(rb));
+  size_t firstPart = min(toWrite, rb.capacity - rb.head);
+  memcpy(rb.data + rb.head, src, firstPart);
+  if (toWrite > firstPart) {
+    memcpy(rb.data, src + firstPart, toWrite - firstPart);
+  }
+  rb.head = (rb.head + toWrite) % rb.capacity;
+  rb.count += toWrite;
+  return toWrite;
+}
+
+// Copies up to `len` bytes out of the ring buffer into `dst`. Returns the
+// number actually copied (<= rb.count).
+static size_t ringRead(RingBuffer &rb, uint8_t *dst, size_t len) {
+  size_t currentCount = rb.count; // snapshot into a plain (non-volatile) local -- std::min requires both arguments to share the same cv-qualification, and rb.count is declared volatile
+  size_t toRead = min(len, currentCount);
+  size_t firstPart = min(toRead, rb.capacity - rb.tail);
+  memcpy(dst, rb.data + rb.tail, firstPart);
+  if (toRead > firstPart) {
+    memcpy(dst + firstPart, rb.data, toRead - firstPart);
+  }
+  rb.tail = (rb.tail + toRead) % rb.capacity;
+  rb.count -= toRead;
+  return toRead;
+}
+
+static uint16_t streamReadLE16(WiFiClient &s, bool &ok) {
   uint8_t b[2];
-  f.read(b, 2);
+  int n = s.readBytes(b, 2);
+  ok = ok && (n == 2);
   return (uint16_t)(b[0] | (b[1] << 8));
 }
 
-static uint32_t readLE32(File &f) {
+static uint32_t streamReadLE32(WiFiClient &s, bool &ok) {
   uint8_t b[4];
-  f.read(b, 4);
+  int n = s.readBytes(b, 4);
+  ok = ok && (n == 4);
   return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
 }
 
-// Parses a standard RIFF/WAVE/PCM header. Walks chunks generically after
-// "WAVE" so a "fmt " chunk that isn't immediately followed by "data"
-// (e.g. a LIST/INFO chunk in between, which some encoders emit) is
-// skipped correctly rather than assumed away. Returns false and logs a
-// reason on any structural or format problem.
-bool parseWavHeader(File &f, WavInfo &info) {
-  char tag[5] = {0};
+// Discards `count` bytes from the stream by reading and dropping them --
+// the streaming equivalent of the old File-based parser's f.seek() past
+// an unknown chunk. A live network stream can't seek (bytes not yet
+// arrived don't exist yet to skip to, and bytes already consumed can't
+// be un-read), so unknown chunks between "fmt " and "data" (LIST/INFO/
+// fact/etc, same as the old parser handled) are read into a small scratch
+// buffer and thrown away instead.
+static bool streamDiscard(WiFiClient &s, uint32_t count, unsigned long deadlineMs) {
+  uint8_t scratch[64];
+  while (count > 0) {
+    if (millis() > deadlineMs) return false;
+    if (!s.connected() && !s.available()) return false;
+    if (s.available()) {
+      int n = s.readBytes(scratch, min((uint32_t)sizeof(scratch), count));
+      if (n <= 0) return false;
+      count -= n;
+    } else {
+      delay(2);
+    }
+  }
+  return true;
+}
 
-  f.seek(0);
-  f.read((uint8_t *)tag, 4);
-  if (memcmp(tag, "RIFF", 4) != 0) {
+// Parses the RIFF/WAVE/fmt/data header directly off the live HTTP body
+// stream, sequentially -- same chunk-walking logic and validation rules
+// as the previous File-based parseWavHeader() (PCM=1 only, 8/16/24/32-bit
+// only, tolerates a LIST/INFO/fact chunk between fmt and data), adapted
+// to a forward-only stream. Stops the instant the "data" chunk header is
+// found, with the stream positioned exactly at the first PCM byte --
+// nothing here reads ahead into the audio payload itself, which
+// streamPlayResponse() below consumes progressively via the ring buffer.
+// Waits until at least one byte is available to read, or gives up on
+// disconnect/deadline/a 10s no-data stall. Plain helper functions (not
+// lambdas) to match this file's existing style.
+static bool streamWaitByte(WiFiClient &s, unsigned long deadlineMs) {
+  unsigned long waitStart = millis();
+  while (!s.available()) {
+    if (!s.connected() || millis() > deadlineMs) return false;
+    if (millis() - waitStart > 10000) return false; // no header bytes at all for 10s -- treat as stalled
+    delay(2);
+  }
+  return true;
+}
+
+static bool streamReadTag(WiFiClient &s, char *t) {
+  int n = s.readBytes((uint8_t *)t, 4);
+  return n == 4;
+}
+
+static bool parseWavHeaderStream(WiFiClient &s, WavInfo &info, unsigned long deadlineMs) {
+  bool ok = true;
+  char tag[4];
+
+  if (!streamWaitByte(s, deadlineMs) || !streamReadTag(s, tag) || memcmp(tag, "RIFF", 4) != 0) {
     Serial.println("WAV parse error: missing RIFF header.");
     return false;
   }
-  readLE32(f); // overall RIFF chunk size — not needed, dataSize below is authoritative
+  streamReadLE32(s, ok); // overall RIFF chunk size — not needed, dataSize from the data chunk is authoritative
 
-  f.read((uint8_t *)tag, 4);
-  if (memcmp(tag, "WAVE", 4) != 0) {
+  if (!streamWaitByte(s, deadlineMs) || !streamReadTag(s, tag) || memcmp(tag, "WAVE", 4) != 0) {
     Serial.println("WAV parse error: missing WAVE marker.");
     return false;
   }
 
-  bool haveFmt = false;
-  bool haveData = false;
-
-  // Walk chunks until both fmt and data are found or EOF.
-  while (f.available() >= 8) {
-    f.read((uint8_t *)tag, 4);
-    uint32_t chunkSize = readLE32(f);
-    uint32_t chunkBodyStart = f.position();
+  bool haveFmt = false, haveData = false;
+  int guard = 0; // bounds the chunk-walk loop -- a malformed stream that never produces a valid "data" tag must not spin forever
+  while (!haveData && guard++ < 32) {
+    if (!streamWaitByte(s, deadlineMs) || !streamReadTag(s, tag)) {
+      Serial.println("WAV parse error: stream ended before data chunk.");
+      return false;
+    }
+    uint32_t chunkSize = streamReadLE32(s, ok);
+    if (!ok) { Serial.println("WAV parse error: truncated chunk header."); return false; }
 
     if (memcmp(tag, "fmt ", 4) == 0) {
-      info.audioFormat = readLE16(f);
-      info.numChannels = readLE16(f);
-      info.sampleRate = readLE32(f);
-      readLE32(f); // byte rate — derivable, not needed directly
-      readLE16(f); // block align — derivable, not needed directly
-      info.bitsPerSample = readLE16(f);
+      info.audioFormat = streamReadLE16(s, ok);
+      info.numChannels = streamReadLE16(s, ok);
+      info.sampleRate = streamReadLE32(s, ok);
+      streamReadLE32(s, ok); // byte rate — derivable, not needed directly
+      streamReadLE16(s, ok); // block align — derivable, not needed directly
+      info.bitsPerSample = streamReadLE16(s, ok);
+      if (!ok) { Serial.println("WAV parse error: truncated fmt chunk."); return false; }
+      // fmt chunk is nominally 16 bytes for PCM; some encoders pad it --
+      // discard anything beyond the 16 bytes already read, same
+      // word-alignment rule as every other chunk.
+      uint32_t fmtRead = 16;
+      if (chunkSize > fmtRead) {
+        if (!streamDiscard(s, chunkSize - fmtRead + (chunkSize % 2), deadlineMs)) return false;
+      } else if (chunkSize % 2) {
+        if (!streamDiscard(s, 1, deadlineMs)) return false;
+      }
       haveFmt = true;
     } else if (memcmp(tag, "data", 4) == 0) {
       info.dataSize = chunkSize;
-      info.dataOffset = chunkBodyStart;
-      haveData = true;
-      // Do not seek past the data chunk — its body is exactly what the
-      // caller streams next; stopping the chunk walk here is correct
-      // and avoids scanning potentially large PCM payload as if it were
-      // more chunk headers.
-      break;
-    }
-
-    if (!haveData) {
-      // Skip this chunk's body (covers LIST/INFO/fact/etc. between fmt
-      // and data — required by the task, not just fmt itself). RIFF
-      // chunks are word-aligned: pad one byte if chunkSize is odd.
-      uint32_t skip = chunkSize + (chunkSize % 2);
-      f.seek(chunkBodyStart + skip);
+      haveData = true; // stream is now positioned exactly at the first PCM byte -- caller reads audio from here
+    } else {
+      // Unknown chunk (LIST/INFO/fact/etc) — discard its body, word-aligned.
+      if (!streamDiscard(s, chunkSize + (chunkSize % 2), deadlineMs)) return false;
     }
   }
 
@@ -1132,114 +1167,185 @@ bool parseWavHeader(File &f, WavInfo &info) {
   Serial.printf("  channels=%u\n", info.numChannels);
   Serial.printf("  sampleRate=%u\n", info.sampleRate);
   Serial.printf("  bits=%u\n", info.bitsPerSample);
-  Serial.printf("  dataSize=%u\n", info.dataSize);
+  Serial.printf("  dataSize=%u (hint; actual end is determined by stream end, not this field)\n", info.dataSize);
   return true;
 }
 
-// Cheap pre-flight check run BEFORE playWavFile()/the I2S path is ever
-// touched — deliberately separate from parseWavHeader()'s full chunk walk
-// (which playWavFile still does on its own right before playback) so a
-// corrupt/truncated download is rejected as early and cheaply as possible:
-// file exists, size is plausible for a WAV (>44-byte header at minimum),
-// and the first 12 bytes actually are "RIFF"...."WAVE" before any chunk
-// parsing is attempted at all.
-bool validateWavFile(const String &path) {
-  if (!LittleFS.exists(path)) {
-    Serial.println("[PLAYBACK_ERROR] response file does not exist.");
-    return false;
+// Writes exactly `len` bytes from `data` to I2S, looping on partial
+// writes and never discarding unwritten bytes -- i2s_write()'s own
+// timeout parameter means a call CAN legitimately return having written
+// fewer bytes than requested (DMA queue temporarily full), and the
+// previous version of this code silently assumed the full count was
+// always written. Returns false only on a real error/timeout with zero
+// progress, not on ordinary partial writes (those just loop and
+// continue).
+static bool i2sWriteAllRetry(const uint8_t *data, size_t len) {
+  size_t sent = 0;
+  unsigned long lastProgress = millis();
+  while (sent < len) {
+    size_t bytesWritten = 0;
+    esp_err_t err = i2s_write(I2S_NUM_0, data + sent, len - sent, &bytesWritten, 100 / portTICK_PERIOD_MS);
+    if (err != ESP_OK) {
+      Serial.printf("[PLAYBACK_ERROR] i2s_write error %d at offset %u/%u\n", err, (unsigned)sent, (unsigned)len);
+      return false;
+    }
+    if (bytesWritten > 0) {
+      sent += bytesWritten;
+      lastProgress = millis();
+    } else if (millis() - lastProgress > 5000) {
+      // i2s_write() returned ESP_OK but wrote 0 bytes repeatedly for 5s
+      // straight -- the DMA queue is stuck, not just momentarily full.
+      Serial.println("[PLAYBACK_ERROR] i2s_write stalled with zero progress.");
+      return false;
+    }
+    // no delay() here: i2s_write()'s own portTICK timeout already yields:
+    // a tight retry loop would only add latency to real-time audio
   }
-
-  File f = LittleFS.open(path, FILE_READ);
-  if (!f) {
-    Serial.println("[PLAYBACK_ERROR] could not open response file for validation.");
-    return false;
-  }
-
-  size_t fileSize = f.size();
-  if (fileSize <= 44) { // must have at least a full canonical WAV header
-    Serial.printf("[PLAYBACK_ERROR] response file too small to be a valid WAV (%u bytes)\n", (unsigned)fileSize);
-    f.close();
-    return false;
-  }
-
-  uint8_t header[12];
-  size_t readN = f.read(header, 12);
-  f.close();
-
-  if (readN != 12 || memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
-    Serial.println("[PLAYBACK_ERROR] response file is not a valid RIFF/WAVE file.");
-    return false;
-  }
-
   return true;
 }
 
-// Streams PCM from LittleFS to I2S TX in small chunks — never loads the
-// whole file into RAM, matching the same approach used for recording.
-//
-// Stereo handling: i2sConfigureTx() above already configures the I2S
-// peripheral's channel format to match the header (RIGHT_LEFT for
-// stereo, ONLY_LEFT for mono), so interleaved stereo PCM bytes can be
-// written straight through with no downmix — this is the "simpler
-// reliable option" the task asks to prefer over downmixing. speak()'s
-// actual output as deployed is mono (confirmed by a live test against
-// the running backend), so this branch is expected to be exercised
-// rarely if ever, but is handled correctly rather than assumed away.
-bool playWavFile(const String &path) {
-  File f = LittleFS.open(path, FILE_READ);
-  if (!f) {
-    Serial.println("PLAYBACK_ERROR: could not open response file.");
+// The core streaming loop: parses the WAV header directly off the
+// already-connected HTTPClient's stream, then alternates filling the
+// ring buffer from the network and draining it to I2S until the stream
+// ends. Never writes the response to LittleFS. Returns false (and
+// leaves I2S torn down) on any error -- per the requirement, corrupted
+// or incomplete data is never played.
+bool streamPlayResponse(HTTPClient &http) {
+  WiFiClient *rawStream = http.getStreamPtr();
+  if (!rawStream) {
+    Serial.println("[PLAYBACK_ERROR] no response stream available.");
     return false;
   }
 
+  unsigned long deadlineMs = millis() + 60000UL; // overall ceiling for header parse + full playback -- generous for a long reply's audio duration, but still bounded so a stalled connection can't hang forever
   WavInfo info;
-  if (!parseWavHeader(f, info)) {
-    f.close();
+  if (!parseWavHeaderStream(*rawStream, info, deadlineMs)) {
+    Serial.println("[PLAYBACK_ERROR] WAV header parse failed.");
     return false;
   }
+  Serial.println("[PLAY] WAV header parsed, starting streaming playback");
 
   if (info.numChannels >= 2) {
     Serial.println("Note: stereo WAV — playing as interleaved stereo via I2S_CHANNEL_FMT_RIGHT_LEFT, no downmix needed.");
   }
 
-  f.seek(info.dataOffset);
+  // Ring buffer lives in static storage, not the stack -- AUDIO_RINGBUF_BYTES
+  // (32KB) would overflow this task's stack if it were a local array.
+  static uint8_t ringStorage[AUDIO_RINGBUF_BYTES];
+  RingBuffer rb;
+  ringInit(rb, ringStorage, sizeof(ringStorage));
+
+  // ---- pre-buffer phase: fill before starting I2S at all ----
+  // A short stall right as playback starts is the worst time for one --
+  // there's no accumulated buffer yet to absorb it. Filling
+  // AUDIO_PREBUFFER_BYTES first (~0.5s of audio at this project's
+  // 16kHz/16-bit/mono format) gives real headroom before the drain side
+  // ever starts pulling from the buffer.
+  uint8_t netChunk[512];
+  unsigned long prebufferDeadline = millis() + 15000UL; // don't wait forever if the stream is unexpectedly short or slow
+  while (rb.count < AUDIO_PREBUFFER_BYTES) {
+    if (millis() > prebufferDeadline) break; // proceed with whatever we have rather than fail outright -- a short reply may never reach the full prebuffer target
+    int availableNow = rawStream->available();
+    if (!rawStream->connected() && availableNow <= 0) break; // stream already ended -- short clip, nothing wrong
+    if (availableNow > 0) {
+      int n = rawStream->readBytes(netChunk, min(sizeof(netChunk), (size_t)availableNow));
+      if (n > 0) ringWrite(rb, netChunk, n);
+    } else {
+      delay(2);
+    }
+  }
+
+  if (rb.count == 0) {
+    Serial.println("[PLAYBACK_ERROR] no audio data received.");
+    return false;
+  }
+
+  Serial.printf("[PLAY] Pre-buffered %u bytes, starting I2S\n", (unsigned)rb.count);
   i2sConfigureTx(info.sampleRate, info.bitsPerSample, info.numChannels);
 
-  Serial.println("[PLAY] Starting WAV");
+  // ---- steady-state: fill from network, drain to I2S, interleaved ----
+  const size_t I2S_CHUNK = 512;
+  uint8_t i2sChunk[I2S_CHUNK];
+  bool streamEnded = false;
+  bool playbackError = false;
+  unsigned long lastAnyProgress = millis();
 
-  const size_t CHUNK = 512;
-  uint8_t buf[CHUNK];
-  uint32_t remaining = info.dataSize;
-  size_t bytesWritten;
+  while (true) {
+    // Fill: pull whatever is available from the network into the ring
+    // buffer without blocking, bounded by remaining ring capacity.
+    if (!streamEnded) {
+      int availableNow = rawStream->available();
+      if (availableNow > 0) {
+        size_t room = ringFree(rb);
+        if (room > 0) {
+          size_t want = min(room, (size_t)availableNow);
+          want = min(want, sizeof(netChunk));
+          int n = rawStream->readBytes(netChunk, want);
+          if (n > 0) {
+            ringWrite(rb, netChunk, n);
+            lastAnyProgress = millis();
+          }
+        }
+      } else if (!rawStream->connected()) {
+        streamEnded = true; // connection closed -- this is the authoritative end-of-audio signal, not the WAV header's dataSize field
+      }
+    }
 
-  while (remaining > 0) {
-    size_t toRead = min((uint32_t)CHUNK, remaining);
-    size_t n = f.read(buf, toRead);
-    if (n == 0) break;
-    i2s_write(I2S_NUM_0, buf, n, &bytesWritten, 100 / portTICK_PERIOD_MS);
-    remaining -= n;
+    // Drain: hand off one I2S-sized chunk from the ring buffer, if any
+    // is available.
+    if (rb.count > 0) {
+      // ringRead() itself already clamps to whatever's actually available
+      // (min(len, rb.count) internally), so simply requesting up to a
+      // full I2S_CHUNK here is correct and avoids comparing against the
+      // volatile rb.count field directly at this call site.
+      size_t n = ringRead(rb, i2sChunk, I2S_CHUNK);
+      if (!i2sWriteAllRetry(i2sChunk, n)) {
+        playbackError = true;
+        break;
+      }
+      lastAnyProgress = millis();
+    } else if (streamEnded) {
+      break; // buffer empty AND network stream is done -- playback complete
+    }
+
+    if (millis() - lastAnyProgress > 15000) {
+      // Neither side made progress for 15s -- a genuine stall (network
+      // and buffer both idle), not the ordinary case of I2S draining
+      // faster than the network can fill.
+      Serial.println("[PLAYBACK_ERROR] streaming stalled (no network or I2S progress).");
+      playbackError = true;
+      break;
+    }
+
+    delay(1);
   }
-  f.close();
 
-  // i2s_write() only guarantees the bytes are QUEUED into the DMA buffer
-  // by the time it returns, not that they've actually finished playing
-  // out through the amp/speaker yet -- calling i2sTeardown() (which
-  // uninstalls the I2S driver) immediately after the last write was
-  // cutting the tail of every clip off, exactly matching "it got cut
-  // short". The TX config above sets dma_buf_count=4 * dma_buf_len=256 =
-  // 1024 samples of buffering headroom; at this WAV's own sample rate
-  // that's up to 1024/sampleRate seconds of audio that can still be
-  // sitting in the DMA buffer, unplayed, the instant the last i2s_write()
-  // call returns. The legacy driver.h API used here has no blocking
-  // "wait until the DMA queue is actually empty" call, so this waits
-  // that worst-case duration (plus a small margin) before tearing the
-  // peripheral down, giving the DMA buffer time to actually finish
-  // draining out to the speaker.
-  uint32_t drainMs = (1024UL * 1000UL / info.sampleRate) + 30;
-  delay(drainMs);
+  // Same reasoning as the previous fixed-delay drain fix, now applied
+  // after a variable-length stream instead of a known-length file: write
+  // ~200ms of silence through i2s_write() itself after the real audio so
+  // the DMA queue is guaranteed to have actually drained (I2S/DMA
+  // delivers samples in strict FIFO order) before i2sTeardown() runs,
+  // rather than relying on a bare delay() estimate.
+  if (!playbackError) {
+    uint16_t bytesPerSample = (info.bitsPerSample / 8) * (info.numChannels >= 2 ? 2 : 1);
+    uint32_t silenceBytes = (info.sampleRate * bytesPerSample * 200) / 1000;
+    static uint8_t silenceBuf[512] = {0};
+    uint32_t silenceRemaining = silenceBytes;
+    while (silenceRemaining > 0) {
+      size_t n = min((uint32_t)sizeof(silenceBuf), silenceRemaining);
+      if (!i2sWriteAllRetry(silenceBuf, n)) break; // best-effort -- a failure here doesn't invalidate audio that already played correctly
+      silenceRemaining -= n;
+    }
+    delay(50);
+  }
 
   i2sTeardown();
-  Serial.println("[PLAY] Finished");
+
+  if (playbackError) {
+    Serial.println("[PLAYBACK_ERROR] streaming playback failed.");
+    return false;
+  }
+  Serial.println("[PLAY] Finished (streamed, never written to LittleFS)");
   return true;
 }
 
