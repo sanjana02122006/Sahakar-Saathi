@@ -1310,6 +1310,8 @@ bool streamPlayResponse(HTTPClient &http) {
   uint32_t totalI2sBytes = 0;
   unsigned long lastStatusLog = millis();
   const unsigned long STATUS_LOG_INTERVAL_MS = 1000; // rate-limited per explicit instruction -- not per byte, not per iteration
+  unsigned long lastRecoveryFailLog = 0;
+  uint32_t recoveryFailStreak = 0; // consecutive fully-failed recovery bursts, reset on any successful recovery
 
   while (true) {
     unsigned long loopNow = millis();
@@ -1321,6 +1323,69 @@ bool streamPlayResponse(HTTPClient &http) {
     if (!streamEnded) {
       bool stillConnected = rawStream->connected();
       int availableNow = rawStream->available();
+
+      // ---- TLS read recovery ----
+      // Root cause (confirmed against the real installed
+      // NetworkClientSecure/ssl_client.cpp on this machine, core 3.3.7,
+      // and matching a previously-reported defect, espressif/
+      // arduino-esp32#942): WiFiClientSecure::available() is backed by
+      // data_to_read(), which calls mbedtls_ssl_read(ctx, NULL, 0) -- a
+      // zero-length probe that asks mbedTLS to check the socket for a
+      // new complete TLS record and report mbedtls_ssl_get_bytes_avail()
+      // afterward. read()/readBytes() are pure wrappers that hard-return
+      // immediately if available() <= 0 (confirmed at
+      // NetworkClientSecure.cpp:271-275) -- they never themselves attempt
+      // a fresh socket read, and there is no public API on this class to
+      // reach the underlying sslclient_context and force one directly
+      // (it is a protected member; read()/available()/peek() are the
+      // only public entry points). The ONLY lever available from calling
+      // code is retrying available() itself and giving the WiFi stack's
+      // own background processing real wall-clock time to actually
+      // deliver the next TLS record before probing again.
+      //
+      // On real hardware, this stalled with the ring buffer already
+      // EMPTY (nothing left to drain) immediately after I2S playback
+      // started -- meaning the main loop's own delay(1) plus whatever
+      // time i2s_write() spends blocked inside the DMA queue (I2S paces
+      // at the real playback sample rate, not CPU speed) was otherwise
+      // the only place WiFi got scheduled between fill attempts. This
+      // recovery burst runs a SHORT bounded number of extra available()
+      // probes, each preceded by its own short delay(), specifically at
+      // the moment fill has nothing to do -- giving WiFi additional
+      // scheduling windows beyond the one main-loop iteration, without
+      // ever blocking indefinitely (bounded retry count + bounded delay
+      // per retry, decided up front, no loop that can spin forever).
+      if (availableNow <= 0 && stillConnected && expectedBytes > 0 &&
+          (long)totalNetworkBytes < expectedBytes) {
+        const int RECOVERY_ATTEMPTS = 5;
+        const unsigned long RECOVERY_DELAY_MS = 10;
+        for (int attempt = 1; attempt <= RECOVERY_ATTEMPTS && availableNow <= 0; attempt++) {
+          delay(RECOVERY_DELAY_MS); // yields to the scheduler -- Arduino's delay() calls vTaskDelay() internally, giving WiFi's own task a real window to run
+          availableNow = rawStream->available();
+          if (availableNow <= 0 && !rawStream->connected()) {
+            stillConnected = false;
+            break; // connection dropped mid-recovery -- stop retrying, fall through to the disconnect handling below
+          }
+        }
+        if (availableNow > 0) {
+          Serial.printf("[STREAM] TLS read recovery received data after retry (available=%d)\n", availableNow);
+          recoveryFailStreak = 0;
+        } else {
+          // Repeated-failure logging is rate-limited to once per second
+          // (its own timestamp, independent of the general status line's
+          // schedule) rather than once per failed burst -- a genuinely
+          // stuck stream would otherwise log this every ~50ms (5 attempts
+          // * 10ms), which is exactly the Serial-flooding this firmware's
+          // diagnostics have deliberately avoided everywhere else.
+          recoveryFailStreak++;
+          if (loopNow - lastRecoveryFailLog >= 1000) {
+            Serial.printf("[STREAM] TLS read recovery attempt failed (streak=%u, remainingExpected=%ld)\n",
+                          (unsigned)recoveryFailStreak, expectedBytes - (long)totalNetworkBytes);
+            lastRecoveryFailLog = loopNow;
+          }
+        }
+      }
+
       if (availableNow > 0) {
         size_t room = ringFree(rb);
         if (room > 0) {
@@ -1347,7 +1412,7 @@ bool streamPlayResponse(HTTPClient &http) {
         streamEnded = true; // connection closed -- this is the authoritative end-of-audio signal, not the WAV header's dataSize field
         fillState = "TCP_DISCONNECTED";
       } else {
-        fillState = "NETWORK_WAIT"; // still connected, simply nothing available from the socket THIS iteration -- normal and expected between TCP segments, not itself an error
+        fillState = "NETWORK_WAIT"; // still connected, simply nothing available from the socket THIS iteration (even after the recovery burst above) -- normal and expected between TCP segments, not itself an error
       }
     }
 
