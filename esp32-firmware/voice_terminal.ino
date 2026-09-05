@@ -179,6 +179,20 @@ static bool lastTouchLevel = LOW;
 static unsigned long lastTouchChangeMs = 0;
 static unsigned long touchDownAtMs = 0;
 
+// Boot-time touch-input settle guard. Real hardware showed a spurious
+// press+release pair firing on its own, with zero physical touch, right
+// at the point WiFi association completes in setup() -- ESP32 WiFi radio
+// activation is a known source of transient GPIO noise, and GPIO3 has no
+// special shielding here. touchArmed stays false (the pin is not trusted
+// yet) until loop() has observed TOUCH_ARM_STABLE_READS consecutive LOW
+// readings, each separated by at least one loop iteration -- so a single
+// glitch sample can never itself arm the input, and any transition
+// during the guard window is discarded outright rather than being fed
+// into the debounce/state-machine logic at all.
+static bool touchArmed = false;
+static int touchArmStableCount = 0;
+#define TOUCH_ARM_STABLE_READS 20
+
 // Tap-gesture tracking
 static int tapCount = 0;
 static unsigned long firstTapAtMs = 0;
@@ -228,7 +242,14 @@ void setup() {
   delay(300);
   Serial.println("\n=== Sahakar Sathi Voice Terminal booting ===");
 
-  pinMode(PIN_TOUCH, INPUT);
+  // INPUT_PULLDOWN (not plain INPUT): actively holds the pin LOW via the
+  // ESP32's own internal pulldown whenever the TTP223 isn't driving it
+  // HIGH, instead of relying solely on the sensor's own output drive plus
+  // an otherwise-floating internal input state. This directly reduces
+  // susceptibility to the transient noise (e.g. from WiFi radio
+  // activation) that was causing spurious touch events with no physical
+  // touch -- paired with the boot-time settle guard below.
+  pinMode(PIN_TOUCH, INPUT_PULLDOWN);
 
   // Same reasoning as the pinMode/digitalWrite added to i2sTeardown():
   // before the very first i2sConfigureTx()/i2sConfigureRx() call, this
@@ -264,6 +285,30 @@ void loop() {
 
   bool level = digitalRead(PIN_TOUCH);
   unsigned long now = millis();
+
+  // ---- boot-time settle guard ----
+  // Do not trust the touch pin at all until it has read a stable LOW for
+  // TOUCH_ARM_STABLE_READS consecutive loop iterations. Any HIGH seen
+  // before arming is discarded outright (not fed into debounce/state
+  // logic) and resets the stable-count back to zero, so a glitch pulse
+  // during the guard window can only delay arming, never itself trigger
+  // onTouchDown/onTouchRelease. This is what actually stops the spurious
+  // press+release pair observed on real hardware right at WiFi-connect
+  // time, before a user has touched anything.
+  if (!touchArmed) {
+    if (level == LOW) {
+      touchArmStableCount++;
+      if (touchArmStableCount >= TOUCH_ARM_STABLE_READS) {
+        touchArmed = true;
+        lastTouchLevel = LOW;
+        lastTouchChangeMs = now;
+        Serial.println("[TOUCH] Input armed (stable).");
+      }
+    } else {
+      touchArmStableCount = 0; // glitch or genuine early touch -- either way, keep waiting for a stable LOW run
+    }
+    return; // touch/recording logic stays fully inactive until armed
+  }
 
   // ---- debounce ----
   if (level != lastTouchLevel) {
