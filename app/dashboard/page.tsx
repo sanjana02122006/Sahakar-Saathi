@@ -499,18 +499,32 @@ export default function DashboardPage() {
             {t("dashboard.schemesHeading")}
           </p>
           <div className="mt-3 space-y-1">
-            {schemes.map((s) => (
-              <button
-                key={s.id}
-                onClick={() => send(t("dashboard.explainScheme", { name: s.name }))}
-                className="w-full rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-secondary"
-              >
-                <span className="block font-medium leading-tight">{s.code}</span>
-                <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                  {s.name}
-                </span>
-              </button>
-            ))}
+            {schemes.map((s) => {
+              // The short code (KCC, PACS-CSC, ...) is an official
+              // abbreviation and stays unlocalized in every language, same
+              // as it would appear in a real government document. Only the
+              // descriptive name underneath is translated, via
+              // lib/i18n/<lang>.ts's `schemes` section (keyed by this same
+              // code). t() falls back to the raw "schemes.CODE" path when
+              // a translation is missing in BOTH the current language and
+              // English -- that's not a usable label, so fall back to the
+              // DB's own English s.name instead for any future scheme code
+              // that hasn't been translated yet.
+              const schemeName = t(`schemes.${s.code}`);
+              const displayName = schemeName === `schemes.${s.code}` ? s.name : schemeName;
+              return (
+                <button
+                  key={s.id}
+                  onClick={() => send(t("dashboard.explainScheme", { name: displayName }))}
+                  className="w-full rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-secondary"
+                >
+                  <span className="block font-medium leading-tight">{s.code}</span>
+                  <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                    {displayName}
+                  </span>
+                </button>
+              );
+            })}
           </div>
 
           <button

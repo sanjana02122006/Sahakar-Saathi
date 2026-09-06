@@ -119,6 +119,22 @@ const en = {
     aboutSubtitle: "Built for Smart India Hackathon 2026 — Problem Statement 26088, Ministry of Cooperation / NCCT.",
     team: "Team",
   },
+
+  // Descriptive scheme NAMES only, keyed by the schemes.code DB column
+  // (PMFBY, SAHAKAR-M, PACS-CSC, NCDC-YUVA, KCC — see supabase/migrations/
+  // 0003_seed.sql). The short code itself is never translated (official
+  // abbreviations stay identical across languages, same as "KCC" in a
+  // Tamil government document); only the fuller name shown under it in
+  // the dashboard sidebar is. summary/benefits/eligibility text is NOT
+  // duplicated here — that's surfaced through the AI/RAG pipeline, which
+  // already replies in the selected language on its own.
+  schemes: {
+    "PMFBY": "Pradhan Mantri Fasal Bima Yojana",
+    "SAHAKAR-M": "Sahakar Mitra Internship",
+    "PACS-CSC": "PACS as Common Service Centres",
+    "NCDC-YUVA": "NCDC Yuva Sahakar",
+    "KCC": "Kisan Credit Card",
+  },
 } as const;
 
 export default en;
