@@ -3,14 +3,14 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import { LANGUAGES, GEMINI_MODELS, type Profile } from "@/lib/types";
+import { GEMINI_MODELS, type Profile } from "@/lib/types";
 import { useI18n } from "@/lib/i18n/provider";
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { ArrowLeft, Loader2, Check, Mic, Sprout, Users, Cpu } from "lucide-react";
+import { ArrowLeft, Loader2, Check, Sprout, Users, Cpu } from "lucide-react";
 
 const TEAM = [
   "Sanjana C", "Swetha E", "Prathiksha J",
@@ -36,10 +36,6 @@ export default function SettingsPage() {
   const [district, setDistrict] = useState("");
   const [pacsName, setPacsName] = useState("");
 
-  // Language mode: "single" pins the assistant to one language (default English).
-  // "multilingual" lets the picker on the dashboard/composer switch per message.
-  const [langMode, setLangMode] = useState<"single" | "multilingual">("single");
-  const [defaultLang, setDefaultLang] = useState("en");
   const [model, setModel] = useState("gemini-3.1-flash-lite");
 
   useEffect(() => {
@@ -57,9 +53,6 @@ export default function SettingsPage() {
         setState(p.state ?? "");
         setDistrict(p.district ?? "");
         setPacsName(p.pacs_name ?? "");
-        setDefaultLang(p.preferred_lang || "en");
-        // Anyone not on plain English is treated as having opted into multilingual mode already.
-        setLangMode(p.preferred_lang && p.preferred_lang !== "en" ? "multilingual" : "single");
         setModel(p.preferred_model || "gemini-3.1-flash-lite");
       }
       setBooting(false);
@@ -83,8 +76,9 @@ export default function SettingsPage() {
         state: state.trim() || null,
         district: district.trim() || null,
         pacs_name: pacsName.trim() || null,
-        // Single mode always resolves to English; multilingual keeps the chosen default.
-        preferred_lang: langMode === "single" ? "en" : defaultLang,
+        // preferred_lang is NOT written here -- the single LanguageSwitcher
+        // (lib/i18n/provider.tsx) owns that column now, saving it the
+        // moment the user picks a language, not on this form's submit.
         preferred_model: model,
       })
       .eq("id", session.user.id);
@@ -114,69 +108,6 @@ export default function SettingsPage() {
 
       <main className="mx-auto max-w-2xl space-y-6 px-4 py-8 sm:px-6">
         <form onSubmit={save} className="space-y-6">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">{t("settings.languageTitle")}</CardTitle>
-              <CardDescription>{t("settings.languageSubtitle")}</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid gap-2 sm:grid-cols-2">
-                <button
-                  type="button"
-                  onClick={() => setLangMode("single")}
-                  className={`rounded-lg border p-3.5 text-left transition-colors ${
-                    langMode === "single" ? "border-primary bg-accent" : "hover:bg-secondary"
-                  }`}
-                >
-                  <span className="flex items-center gap-2 text-sm font-medium">
-                    {t("settings.englishOnly")}
-                    {langMode === "single" && <Check className="h-3.5 w-3.5 text-primary" />}
-                  </span>
-                  <span className="mt-1 block text-xs text-muted-foreground">
-                    {t("settings.englishOnlyDesc")}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setLangMode("multilingual")}
-                  className={`rounded-lg border p-3.5 text-left transition-colors ${
-                    langMode === "multilingual" ? "border-primary bg-accent" : "hover:bg-secondary"
-                  }`}
-                >
-                  <span className="flex items-center gap-2 text-sm font-medium">
-                    {t("settings.multilingual")}
-                    {langMode === "multilingual" && <Check className="h-3.5 w-3.5 text-primary" />}
-                  </span>
-                  <span className="mt-1 block text-xs text-muted-foreground">
-                    {t("settings.multilingualDesc")}
-                  </span>
-                </button>
-              </div>
-
-              {langMode === "multilingual" && (
-                <div className="space-y-2 pt-1">
-                  <Label htmlFor="lang">{t("settings.defaultLanguage")}</Label>
-                  <select
-                    id="lang"
-                    value={defaultLang}
-                    onChange={(e) => setDefaultLang(e.target.value)}
-                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-64"
-                  >
-                    {LANGUAGES.map((l) => (
-                      <option key={l.code} value={l.code}>{l.native} — {l.label}</option>
-                    ))}
-                  </select>
-                </div>
-              )}
-
-              <div className="flex items-start gap-2 rounded-md bg-secondary px-3 py-2.5 text-xs text-muted-foreground">
-                <Mic className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>{t("settings.voiceNote")}</span>
-              </div>
-            </CardContent>
-          </Card>
-
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-base">

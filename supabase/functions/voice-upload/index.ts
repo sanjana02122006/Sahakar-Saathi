@@ -138,16 +138,38 @@ function hexByteaToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
+// 2-letter profiles.preferred_lang codes -> Sarvam's BCP-47 language_code.
+// Same 9-language set as lib/i18n and lib/types.ts LANGUAGES on the
+// frontend (kept in sync by hand — Edge Functions each deploy as
+// independent bundles in this project, see the TARGET_USER_ID comment).
+const SARVAM_BCP47: Record<string, string> = {
+  en: "en-IN", hi: "hi-IN", mr: "mr-IN", ta: "ta-IN", te: "te-IN",
+  bn: "bn-IN", gu: "gu-IN", kn: "kn-IN", pa: "pa-IN",
+};
+
 // ---------- shared: transcribe + broadcast (used by both request shapes) ----------
-async function transcribeAndBroadcast(fileBytes: Uint8Array, lang: string | null): Promise<{ ok: true; text: string } | { ok: false; status: number; body: Record<string, unknown> }> {
+// The `lang` the ESP32 firmware sends is IGNORED here on purpose: this is
+// a single-device MVP (see TARGET_USER_ID above), and the firmware has no
+// way to know which language the account currently has selected on the
+// dashboard. Instead, the account's own saved preference
+// (profiles.preferred_lang, the same value the dashboard/settings write
+// and the same one the AI reply is generated in) is looked up fresh on
+// every transcription, so STT always matches whatever language is
+// currently selected -- never a hardcoded default.
+async function transcribeAndBroadcast(fileBytes: Uint8Array): Promise<{ ok: true; text: string; lang: string } | { ok: false; status: number; body: Record<string, unknown> }> {
   if (!SARVAM_API_KEY) {
     return { ok: false, status: 503, body: { error: "Voice transcription is not configured yet.", unsupported: true } };
   }
 
+  const { data: profile } = await admin
+    .from("profiles").select("preferred_lang").eq("id", TARGET_USER_ID).single();
+  const lang = (profile?.preferred_lang as string | undefined) || "en";
+  const sarvamLang = SARVAM_BCP47[lang] || "en-IN";
+
   const forward = new FormData();
   forward.set("file", new File([fileBytes], "recording.wav", { type: "audio/wav" }));
   forward.set("model", "saaras:v3");
-  if (lang) forward.set("language_code", lang);
+  forward.set("language_code", sarvamLang);
 
   const sarvamRes = await fetch("https://api.sarvam.ai/speech-to-text", {
     method: "POST",
@@ -189,6 +211,7 @@ async function transcribeAndBroadcast(fileBytes: Uint8Array, lang: string | null
       event: "voice_transcript",
       payload: {
         text,
+        lang,
         nonce: crypto.randomUUID(),
         ts: new Date().toISOString(),
         source: "esp32-mic",
@@ -197,7 +220,7 @@ async function transcribeAndBroadcast(fileBytes: Uint8Array, lang: string | null
     await client.removeChannel(channel);
   }
 
-  return { ok: true, text };
+  return { ok: true, text, lang };
 }
 
 Deno.serve(async (req) => {
@@ -421,7 +444,7 @@ Deno.serve(async (req) => {
           offset += chunk.length;
         }
 
-        const result = await transcribeAndBroadcast(fileBytes, session.lang);
+        const result = await transcribeAndBroadcast(fileBytes);
 
         // Cleanup: delete the session row regardless of transcription
         // outcome — chunk rows cascade-delete with it (ON DELETE CASCADE,
@@ -440,7 +463,6 @@ Deno.serve(async (req) => {
     const incoming = await req.formData();
     const deviceKey = incoming.get("device_key");
     const file = incoming.get("file");
-    const lang = incoming.get("lang");
 
     if (!deviceKey || deviceKey !== DEVICE_API_KEY) {
       return json({ error: "Invalid device key" }, 401);
@@ -450,7 +472,7 @@ Deno.serve(async (req) => {
     }
 
     const fileBytes = new Uint8Array(await file.arrayBuffer());
-    const result = await transcribeAndBroadcast(fileBytes, typeof lang === "string" && lang ? lang : null);
+    const result = await transcribeAndBroadcast(fileBytes);
     if (!result.ok) return json(result.body, result.status);
     return json({ ok: true, text: result.text });
   } catch (err) {

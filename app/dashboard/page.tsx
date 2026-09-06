@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import { LANGUAGES, type Message, type Profile, type Scheme } from "@/lib/types";
+import { type Message, type Profile, type Scheme } from "@/lib/types";
 import { useI18n } from "@/lib/i18n/provider";
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
@@ -38,13 +38,17 @@ type TurnOrigin = "browser" | "esp32";
 
 export default function DashboardPage() {
   const router = useRouter();
-  const { t } = useI18n();
+  // Single language selection drives UI chrome, assistant replies, and
+  // STT/TTS together -- there is no separate "reply language" anymore.
+  // Persisted to profiles.preferred_lang by the provider itself (see
+  // lib/i18n/provider.tsx), so it survives a refresh and follows the
+  // account, not just this browser.
+  const { t, lang } = useI18n();
   const [profile, setProfile] = useState<Profile | null>(null);
   const [schemes, setSchemes] = useState<Scheme[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [lang, setLang] = useState("en");
   const [sending, setSending] = useState(false);
   const [listening, setListening] = useState(false);
   const [booting, setBooting] = useState(true);
@@ -67,7 +71,7 @@ export default function DashboardPage() {
         supabase.from("schemes").select("*").order("code"),
       ]);
 
-      if (prof) { setProfile(prof as Profile); setLang(prof.preferred_lang || "en"); }
+      if (prof) setProfile(prof as Profile);
       if (schemeRows) setSchemes(schemeRows as Scheme[]);
       setBooting(false);
     })();
@@ -468,15 +472,6 @@ export default function DashboardPage() {
           <span className="font-semibold tracking-tight">{t("app.name")}</span>
         </div>
         <div className="flex items-center gap-2">
-          <select
-            value={lang}
-            onChange={(e) => setLang(e.target.value)}
-            className="h-9 rounded-md border border-input bg-background px-2.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label="Assistant reply language"
-            title="Assistant reply language"
-          >
-            {LANGUAGES.map((l) => <option key={l.code} value={l.code}>{l.native}</option>)}
-          </select>
           <LanguageSwitcher />
           <Button variant="ghost" size="sm" onClick={() => { setMessages([]); setConversationId(null); }}>
             <Plus className="h-4 w-4" /> {t("common.new")}
