@@ -118,6 +118,13 @@ const bn: TranslationDict = {
     "PACS-CSC": "সাধারণ সেবা কেন্দ্র হিসেবে PACS",
     "NCDC-YUVA": "এনসিডিসি যুব সহকার",
     "KCC": "কিষান ক্রেডিট কার্ড"
+  },
+  "citations": {
+    "Multi-State Cooperative Societies Act, 2002 — Member Rights & Governance": "বহু-রাজ্য সমবায় সমিতি আইন, ২০০২ — সদস্য অধিকার ও পরিচালনা",
+    "Model By-Laws for Primary Agricultural Credit Societies (PACS)": "প্রাথমিক কৃষি ঋণ সমিতির (PACS) জন্য আদর্শ উপ-বিধি",
+    "PMFBY Operational Guidelines — Claims, Premium & Timelines": "PMFBY পরিচালন নির্দেশিকা — দাবি, প্রিমিয়াম ও সময়সীমা",
+    "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "কিষান ক্রেডিট কার্ড — যোগ্যতা, সীমা ও আর্থিক সাক্ষরতা",
+    "Cooperative Grievance Redressal — Authorities & Escalation Path": "সমবায় অভিযোগ নিষ্পত্তি — কর্তৃপক্ষ ও বর্ধিতকরণ পথ"
   }
 };
 

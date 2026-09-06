@@ -118,6 +118,13 @@ const ta: TranslationDict = {
     "PACS-CSC": "பொது சேவை மையங்களாக PACS",
     "NCDC-YUVA": "NCDC யுவ சஹகார்",
     "KCC": "விவசாயி கடன் அட்டை"
+  },
+  "citations": {
+    "Multi-State Cooperative Societies Act, 2002 — Member Rights & Governance": "பல்-மாநில கூட்டுறவுச் சங்கங்கள் சட்டம், 2002 — உறுப்பினர் உரிமைகள் மற்றும் நிர்வாகம்",
+    "Model By-Laws for Primary Agricultural Credit Societies (PACS)": "முதன்மை வேளாண் கடன் சங்கங்களுக்கான (PACS) மாதிரி துணைச் சட்டங்கள்",
+    "PMFBY Operational Guidelines — Claims, Premium & Timelines": "PMFBY செயல்பாட்டு வழிகாட்டுதல்கள் — உரிமைகோரல்கள், பிரீமியம் மற்றும் காலவரம்புகள்",
+    "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "விவசாயி கடன் அட்டை — தகுதி, வரம்புகள் மற்றும் நிதி அறிவு",
+    "Cooperative Grievance Redressal — Authorities & Escalation Path": "கூட்டுறவு குறை தீர்வு — அதிகாரிகள் மற்றும் மேல்முறையீட்டு வழிமுறை"
   }
 };
 

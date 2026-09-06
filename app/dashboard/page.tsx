@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { type Message, type Profile, type Scheme } from "@/lib/types";
 import { useI18n } from "@/lib/i18n/provider";
+import { DICTS } from "@/lib/i18n";
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -575,17 +576,29 @@ export default function DashboardPage() {
                       <p className="whitespace-pre-wrap text-sm leading-relaxed">{m.content}</p>
                       {m.citations?.length > 0 && (
                         <div className="flex flex-wrap gap-1.5 pt-1">
-                          {m.citations.map((c, i) => (
-                            <a
-                              key={i}
-                              href={c.source_url ?? "#"}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="rounded-full border px-2.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-secondary"
-                            >
-                              {c.title}
-                            </a>
-                          ))}
+                          {m.citations.map((c, i) => {
+                            // Citation titles come from kb_documents.title
+                            // (English source documents) via the chat
+                            // function's RAG lookup -- there's no per-
+                            // language column or document id in this
+                            // payload to key off (see the `citations`
+                            // section of lib/i18n/en.ts for why). Direct
+                            // dictionary lookup by the English title text
+                            // itself, falling back to that same English
+                            // text for any title not yet translated.
+                            const localizedTitle = (DICTS[lang] as any)?.citations?.[c.title] ?? c.title;
+                            return (
+                              <a
+                                key={i}
+                                href={c.source_url ?? "#"}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="rounded-full border px-2.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-secondary"
+                              >
+                                {localizedTitle}
+                              </a>
+                            );
+                          })}
                         </div>
                       )}
                     </div>

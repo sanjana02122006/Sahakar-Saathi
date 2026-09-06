@@ -122,6 +122,13 @@ const kn: TranslationDict = {
     "NCDC-YUVA": "NCDC ಯುವ ಸಹಕಾರ್",
     "KCC": "ಕಿಸಾನ್ ಕ್ರೆಡಿಟ್ ಕಾರ್ಡ್",
   },
+  citations: {
+    "Multi-State Cooperative Societies Act, 2002 — Member Rights & Governance": "ಬಹು-ರಾಜ್ಯ ಸಹಕಾರ ಸಂಘಗಳ ಕಾಯ್ದೆ, 2002 — ಸದಸ್ಯರ ಹಕ್ಕುಗಳು ಮತ್ತು ಆಡಳಿತ",
+    "Model By-Laws for Primary Agricultural Credit Societies (PACS)": "ಪ್ರಾಥಮಿಕ ಕೃಷಿ ಸಾಲ ಸಂಘಗಳಿಗೆ (PACS) ಮಾದರಿ ಉಪ-ನಿಯಮಗಳು",
+    "PMFBY Operational Guidelines — Claims, Premium & Timelines": "PMFBY ಕಾರ್ಯಾಚರಣೆ ಮಾರ್ಗಸೂಚಿಗಳು — ಕ್ಲೇಮ್‌ಗಳು, ಪ್ರೀಮಿಯಂ ಮತ್ತು ಕಾಲಮಿತಿ",
+    "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "ಕಿಸಾನ್ ಕ್ರೆಡಿಟ್ ಕಾರ್ಡ್ — ಅರ್ಹತೆ, ಮಿತಿಗಳು ಮತ್ತು ಆರ್ಥಿಕ ಸಾಕ್ಷರತೆ",
+    "Cooperative Grievance Redressal — Authorities & Escalation Path": "ಸಹಕಾರ ಕುಂದುಕೊರತೆ ಪರಿಹಾರ — ಅಧಿಕಾರಿಗಳು ಮತ್ತು ಹೆಚ್ಚಳ ಮಾರ್ಗ",
+  },
 };
 
 export default kn;

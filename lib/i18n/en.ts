@@ -135,6 +135,26 @@ const en = {
     "NCDC-YUVA": "NCDC Yuva Sahakar",
     "KCC": "Kisan Credit Card",
   },
+
+  // Citation chip titles shown under an assistant reply, keyed by the
+  // ENGLISH title text itself (kb_documents.title, every row currently
+  // lang='en' — confirmed via a live query against the 5 rows that exist
+  // today). Keyed by title text rather than kb_documents.id because the
+  // `chat` function's citations array (supabase/functions/chat/index.ts,
+  // match_kb_chunks RPC) never returns the document id at all, only
+  // title/source_url/similarity -- changing that would need a DB
+  // function + Edge Function change, which isn't needed here since the
+  // 5 existing titles are already unique. Same reasoning as `schemes`
+  // above: a small, fixed, hand-translated set. If a future kb_documents
+  // title isn't a key here, the dashboard falls back to showing that
+  // English title as-is rather than a raw lookup-path string.
+  citations: {
+    "Multi-State Cooperative Societies Act, 2002 — Member Rights & Governance": "Multi-State Cooperative Societies Act, 2002 — Member Rights & Governance",
+    "Model By-Laws for Primary Agricultural Credit Societies (PACS)": "Model By-Laws for Primary Agricultural Credit Societies (PACS)",
+    "PMFBY Operational Guidelines — Claims, Premium & Timelines": "PMFBY Operational Guidelines — Claims, Premium & Timelines",
+    "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "Kisan Credit Card — Eligibility, Limits & Financial Literacy",
+    "Cooperative Grievance Redressal — Authorities & Escalation Path": "Cooperative Grievance Redressal — Authorities & Escalation Path",
+  },
 } as const;
 
 export default en;

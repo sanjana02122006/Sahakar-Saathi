@@ -118,6 +118,13 @@ const gu: TranslationDict = {
     "PACS-CSC": "સામાન્ય સેવા કેન્દ્રો તરીકે PACS",
     "NCDC-YUVA": "NCDC યુવા સહકાર",
     "KCC": "કિસાન ક્રેડિટ કાર્ડ"
+  },
+  "citations": {
+    "Multi-State Cooperative Societies Act, 2002 — Member Rights & Governance": "બહુ-રાજ્ય સહકારી મંડળી અધિનિયમ, 2002 — સભ્ય અધિકારો અને શાસન",
+    "Model By-Laws for Primary Agricultural Credit Societies (PACS)": "પ્રાથમિક કૃષિ ધિરાણ મંડળીઓ (PACS) માટે નમૂનારૂપ પેટા-નિયમો",
+    "PMFBY Operational Guidelines — Claims, Premium & Timelines": "PMFBY સંચાલન માર્ગદર્શિકા — દાવા, પ્રીમિયમ અને સમયમર્યાદા",
+    "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "કિસાન ક્રેડિટ કાર્ડ — પાત્રતા, મર્યાદા અને નાણાકીય સાક્ષરતા",
+    "Cooperative Grievance Redressal — Authorities & Escalation Path": "સહકારી ફરિયાદ નિવારણ — સત્તાધિકારીઓ અને વૃદ્ધિ પ્રક્રિયા"
   }
 };
 
