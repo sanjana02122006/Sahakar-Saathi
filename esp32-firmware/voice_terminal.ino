@@ -1700,6 +1700,31 @@ void saveWifiCredentials(const String &ssid, const String &password) {
 bool connectWifi(const String &ssid, const String &password, uint32_t timeoutMs) {
   Serial.println("Connecting to WiFi: " + ssid);
   WiFi.mode(WIFI_STA);
+
+  // Disable WiFi modem sleep. The ESP32 enables WIFI_PS_MIN_MODEM by
+  // default in station mode: the radio sleeps between the AP's beacon
+  // intervals (~100ms) and only wakes to collect buffered traffic. That
+  // is fine for request/response traffic, but it throttles a sustained
+  // download into bursts separated by sleep intervals -- and this
+  // firmware streams audio in real time, where the I2S side drains at a
+  // fixed 32000 bytes/sec (16kHz/16-bit/mono) and cannot wait.
+  //
+  // The failure this fixes is specific to the idle replay path
+  // (checkForQueuedAudio, triggered by the dashboard's per-message
+  // speaker button): after minutes in ST_IDLE with only tiny 3s
+  // 204-polls, the radio settles into its sleep duty cycle, so when a
+  // real WAV body finally arrives it trickles in slower than playback
+  // consumes it. Once the AUDIO_PREBUFFER_BYTES cushion (~0.5s) is
+  // spent, the ring buffer underruns and I2S -- which never pauses --
+  // emits choppy/distorted audio. The post-upload path did not show this
+  // because a ~135KB TLS upload immediately beforehand keeps the radio
+  // continuously awake, so the stream arrives at full speed.
+  //
+  // Kept fully awake rather than tuned, because this terminal is
+  // mains-powered and must be ready to receive a queued clip at any
+  // moment; modem-sleep's power saving only matters on battery.
+  WiFi.setSleep(false);
+
   WiFi.begin(ssid.c_str(), password.c_str());
 
   unsigned long start = millis();
