@@ -141,6 +141,25 @@ static const char *RECORDING_PATH = "/recording.wav";
 // 120s so the device doesn't give up on a slow-but-healthy turn.
 #define POLL_TIMEOUT_MS  120000
 
+// Idle replay polling. Separate from the post-upload poll above: that one
+// is a tight 500ms loop bounded by POLL_TIMEOUT_MS, because a reply to a
+// question the user JUST asked is expected within seconds and the device
+// has nothing else to do while waiting. This one instead runs forever, in
+// the background, while the device sits in ST_IDLE -- it exists so the
+// dashboard's per-message "replay on the speaker" button reaches the
+// hardware at all. Without it, voice-output would queue a clip that
+// nothing ever collects until the next push-to-talk, where it would be
+// picked up as if it were the answer to that new question.
+//
+// 3s (not 500ms) because this runs indefinitely rather than for a bounded
+// window: at 500ms an idle device would issue ~172k requests a day, each
+// paying a full TLS handshake, purely to be told 204 No Content almost
+// every time. 3s keeps replay latency well within "press button, it
+// speaks" territory while cutting that by 6x. The check is additionally
+// gated on WL_CONNECTED so a device that dropped WiFi doesn't burn the
+// whole loop on connect() attempts that cannot succeed.
+#define IDLE_POLL_INTERVAL_MS 3000
+
 // Streaming playback ring buffer. 32KB chosen conservatively: real
 // hardware logs from this project's own upload path (ESP.getFreeHeap(),
 // logged during active WiFiClientSecure/TLS use) showed 180-190KB free
@@ -197,6 +216,12 @@ static int touchArmStableCount = 0;
 static int tapCount = 0;
 static unsigned long firstTapAtMs = 0;
 
+// Idle replay polling (see IDLE_POLL_INTERVAL_MS). Starts at 0 rather
+// than millis() so the very first check happens promptly after boot
+// instead of waiting out a full interval -- if a clip was queued while
+// the device was powered off, it plays as soon as WiFi comes up.
+static unsigned long lastIdlePollMs = 0;
+
 // Recording state
 static File recordingFile;
 static uint32_t recordedBytes = 0;
@@ -228,6 +253,7 @@ void patchWavHeader(File &f, uint32_t dataBytes);
 
 bool uploadRecording();
 bool pollAndPlayResponse();
+bool checkForQueuedAudio();
 
 struct WavInfo; // full definition below, near parseWavHeaderStream/streamPlayResponse
 struct RingBuffer; // full definition below, near streamPlayResponse
@@ -345,6 +371,25 @@ void loop() {
 
   if (state == ST_RECORDING) {
     writePcmChunk();
+  }
+
+  // ---- idle replay poll ----
+  // Only while genuinely idle: ST_IDLE excludes recording/uploading/
+  // polling/playing (those paths own the network and the I2S peripheral
+  // and must not have a second fetch racing them), and tapCount == 0
+  // excludes ST_SETUP_GESTURE's in-progress tap sequence, so a
+  // multi-second playback can't start between taps 2 and 3 and swallow
+  // the rest of the WiFi-setup gesture. WL_CONNECTED gates out the
+  // no-network case entirely rather than retrying a doomed connect().
+  //
+  // checkForQueuedAudio() briefly blocks for one HTTP round trip (and,
+  // on a 200, for the length of the clip) -- acceptable here precisely
+  // because it only runs when there is nothing else in flight, and the
+  // touch pin is re-read at the top of the very next iteration.
+  if (state == ST_IDLE && tapCount == 0 && WiFi.status() == WL_CONNECTED &&
+      (now - lastIdlePollMs) >= IDLE_POLL_INTERVAL_MS) {
+    lastIdlePollMs = now;
+    checkForQueuedAudio();
   }
 }
 
@@ -986,6 +1031,49 @@ bool pollAndPlayResponse() {
   }
 
   Serial.println("STT_ERROR/TTS_ERROR: poll timed out with no response.");
+  return false;
+}
+
+// ONE non-blocking voice-fetch check, for the idle path only.
+//
+// Deliberately NOT reusing pollAndPlayResponse(): that function blocks
+// the caller for up to POLL_TIMEOUT_MS (120s) retrying in a tight loop,
+// which is correct right after an upload (the device is committed to
+// waiting for that specific reply and has nothing else to do) but would
+// be wrong here -- loop() must stay responsive to touch input, and a
+// device sitting idle has no reason to believe a clip is coming at all.
+// So this makes exactly one request and returns immediately either way:
+// 204 (the overwhelmingly common case) costs one round trip and nothing
+// else, and only an actual 200 hands off to the same streamPlayResponse()
+// the post-upload path uses -- identical playback behavior, identical
+// consumed-marking server-side, just a different trigger.
+//
+// Returns true only if a clip was actually fetched AND played.
+bool checkForQueuedAudio() {
+  WiFiClientSecure client;
+  client.setInsecure(); // prototype-only, same as every other call in this firmware
+
+  HTTPClient http;
+  String url = String(VOICE_FETCH_URL) + "?device_key=" + String(DEVICE_API_KEY);
+  if (!http.begin(client, url)) return false; // silent: an idle-path failure is not worth logging every 3s
+
+  int code = http.GET();
+
+  if (code == 200) {
+    Serial.println("[IDLE] Queued audio found — playing.");
+    bool played = streamPlayResponse(http);
+    http.end();
+    return played;
+  }
+
+  // 204 (nothing queued) is the normal, expected case here and is
+  // intentionally not logged -- it would otherwise flood Serial with a
+  // line every 3 seconds forever. Anything else is a real anomaly worth
+  // seeing, but still non-fatal: just try again on the next interval.
+  if (code != 204) {
+    Serial.printf("[IDLE] voice-fetch unexpected status %d\n", code);
+  }
+  http.end();
   return false;
 }
 

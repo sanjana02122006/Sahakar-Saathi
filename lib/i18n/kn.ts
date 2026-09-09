@@ -44,6 +44,8 @@ const kn: TranslationDict = {
     voiceInput: "ಧ್ವನಿ ಇನ್‌ಪುಟ್",
     muteReplies: "ಧ್ವನಿ ಪ್ರತ್ಯುತ್ತರಗಳನ್ನು ಮ್ಯೂಟ್ ಮಾಡಿ",
     unmuteReplies: "ಧ್ವನಿ ಪ್ರತ್ಯುತ್ತರಗಳನ್ನು ಅನ್‌ಮ್ಯೂಟ್ ಮಾಡಿ",
+    playOnDevice: "ಸಾಧನದಲ್ಲಿ ಪ್ಲೇ ಮಾಡಿ",
+    sentToDevice: "ಸಾಧನಕ್ಕೆ ಕಳುಹಿಸಲಾಗಿದೆ",
     schemesHeading: "ಯೋಜನೆಗಳು",
     fileGrievance: "ಕುಂದುಕೊರತೆ ದಾಖಲಿಸಿ",
     suggestionLawTitle: "ಸಹಕಾರ ಕಾನೂನು",

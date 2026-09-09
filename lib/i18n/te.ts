@@ -43,6 +43,8 @@ const te: TranslationDict = {
     "voiceInput": "వాయిస్ ఇన్‌పుట్",
     "muteReplies": "వాయిస్ సమాధానాలను మ్యూట్ చేయి",
     "unmuteReplies": "వాయిస్ సమాధానాలను అన్‌మ్యూట్ చేయి",
+    "playOnDevice": "పరికరంలో ప్లే చేయి",
+    "sentToDevice": "పరికరానికి పంపబడింది",
     "schemesHeading": "పథకాలు",
     "fileGrievance": "ఫిర్యాదును నమోదు చేయండి",
     "suggestionLawTitle": "సహకార చట్టం",

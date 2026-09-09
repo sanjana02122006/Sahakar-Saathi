@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Sprout, Send, Mic, MicOff, LogOut, Plus, Loader2, Settings, Volume2, VolumeX,
-  Scale, FileText, ShieldCheck, Wallet, MessageSquareWarning,
+  Scale, FileText, ShieldCheck, Wallet, MessageSquareWarning, Check,
 } from "lucide-react";
 
 const SUGGESTIONS = [
@@ -342,10 +342,14 @@ export default function DashboardPage() {
   // threaded through the middle of it. Receives the SAME already-
   // truncated text send() already displayed and passed to the browser's
   // own speak() call -- no separate trimming here anymore.
-  async function mirrorAudioToDevice(text: string) {
+  // Returns whether the clip actually made it into the device queue, so
+  // the per-message replay button can show a real success/failure state
+  // instead of optimistically claiming it worked. The automatic
+  // esp32-origin call site ignores this return value, exactly as before.
+  async function mirrorAudioToDevice(text: string): Promise<boolean> {
     try {
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session) return;
+      if (!session) return false;
 
       const speakRes = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/speak`, {
         method: "POST",
@@ -355,7 +359,7 @@ export default function DashboardPage() {
       const speakData = await speakRes.json();
       if (!speakRes.ok || speakData.unsupported || !speakData.audio) {
         console.error("[esp32 voice-output] speak() failed, nothing queued for the device:", speakData.error);
-        return;
+        return false;
       }
 
       const outputRes = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/voice-output`, {
@@ -365,13 +369,50 @@ export default function DashboardPage() {
       });
       if (!outputRes.ok) {
         console.error("[esp32 voice-output] queue insert failed:", await outputRes.text());
+        return false;
       }
+      return true;
     } catch (err) {
       // Non-fatal by design: a hardware terminal that's offline, slow, or
       // failing should never break the dashboard's chat UI. The ESP32
       // simply won't have this reply queued; the user sees the text
       // reply either way (send() already appended it before speak() runs).
       console.error("[esp32 voice-output] mirror failed:", err);
+      return false;
+    }
+  }
+
+  /* ---------- manual replay to the hardware speaker ----------
+   * Re-sends an already-displayed assistant reply to the physical
+   * terminal on demand. Reuses mirrorAudioToDevice() rather than adding
+   * a parallel path: TTS is regenerated from the same stored text and
+   * queued through the same voice-output endpoint the automatic
+   * esp32-origin flow uses, so the device sees an ordinary queued clip
+   * and needs no special handling to tell a replay from a first play.
+   *
+   * The ESP32 collects it via its idle voice-fetch poll (see
+   * IDLE_POLL_INTERVAL_MS in esp32-firmware/voice_terminal.ino) -- which
+   * is what makes this button work at all while the device is sitting
+   * idle, rather than the clip waiting in the queue until someone next
+   * presses the physical button.
+   *
+   * Keyed by message id so only the pressed row shows a spinner, and a
+   * second press is ignored while one is already in flight.
+   */
+  const [replayingId, setReplayingId] = useState<string | null>(null);
+  const [replayedId, setReplayedId] = useState<string | null>(null);
+
+  async function replayOnDevice(message: Message) {
+    if (replayingId) return; // one at a time -- avoids queueing the same clip twice on a double-click
+    setReplayingId(message.id);
+    setReplayedId(null);
+    const ok = await mirrorAudioToDevice(message.content);
+    setReplayingId(null);
+    if (ok) {
+      setReplayedId(message.id);
+      // Clear the confirmation after a few seconds so the row returns to
+      // its normal state rather than looking permanently "sent".
+      setTimeout(() => setReplayedId((cur) => (cur === message.id ? null : cur)), 4000);
     }
   }
 
@@ -574,6 +615,24 @@ export default function DashboardPage() {
                       }
                     >
                       <p className="whitespace-pre-wrap text-sm leading-relaxed">{m.content}</p>
+                      {m.role === "assistant" && m.content.trim() && (
+                        <button
+                          onClick={() => replayOnDevice(m)}
+                          disabled={replayingId !== null}
+                          title={t("dashboard.playOnDevice")}
+                          aria-label={t("dashboard.playOnDevice")}
+                          className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-50"
+                        >
+                          {replayingId === m.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : replayedId === m.id ? (
+                            <Check className="h-3.5 w-3.5 text-primary" />
+                          ) : (
+                            <Volume2 className="h-3.5 w-3.5" />
+                          )}
+                          {replayedId === m.id ? t("dashboard.sentToDevice") : t("dashboard.playOnDevice")}
+                        </button>
+                      )}
                       {m.citations?.length > 0 && (
                         <div className="flex flex-wrap gap-1.5 pt-1">
                           {m.citations.map((c, i) => {

@@ -43,6 +43,8 @@ const mr: TranslationDict = {
     "voiceInput": "व्हॉइस इनपुट",
     "muteReplies": "आवाज उत्तरे बंद करा",
     "unmuteReplies": "आवाज उत्तरे सुरू करा",
+    "playOnDevice": "डिव्हाइसवर वाजवा",
+    "sentToDevice": "डिव्हाइसवर पाठवले",
     "schemesHeading": "योजना",
     "fileGrievance": "तक्रार नोंदवा",
     "suggestionLawTitle": "सहकारी कायदा",

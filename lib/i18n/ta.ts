@@ -43,6 +43,8 @@ const ta: TranslationDict = {
     "voiceInput": "குரல் உள்ளீடு",
     "muteReplies": "குரல் பதில்களை முடக்கவும்",
     "unmuteReplies": "குரல் பதில்களை ஒலிக்கச் செய்யவும்",
+    "playOnDevice": "சாதனத்தில் ஒலிக்கவும்",
+    "sentToDevice": "சாதனத்திற்கு அனுப்பப்பட்டது",
     "schemesHeading": "திட்டங்கள்",
     "fileGrievance": "குறையைப் பதிவு செய்யவும்",
     "suggestionLawTitle": "கூட்டுறவுச் சட்டம்",

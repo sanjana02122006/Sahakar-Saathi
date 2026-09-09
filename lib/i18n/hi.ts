@@ -43,6 +43,8 @@ const hi: TranslationDict = {
     "voiceInput": "वॉयस इनपुट",
     "muteReplies": "वॉयस रिप्लाई म्यूट करें",
     "unmuteReplies": "वॉयस रिप्लाई अनम्यूट करें",
+    "playOnDevice": "डिवाइस पर चलाएँ",
+    "sentToDevice": "डिवाइस पर भेजा गया",
     "schemesHeading": "योजनाएं",
     "fileGrievance": "शिकायत दर्ज करें",
     "suggestionLawTitle": "सहकारी कानून",

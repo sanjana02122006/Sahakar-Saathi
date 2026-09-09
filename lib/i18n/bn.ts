@@ -43,6 +43,8 @@ const bn: TranslationDict = {
     "voiceInput": "ভয়েস ইনপুট",
     "muteReplies": "ভয়েস রিপ্লাই বন্ধ করুন",
     "unmuteReplies": "ভয়েস রিপ্লাই চালু করুন",
+    "playOnDevice": "ডিভাইসে চালান",
+    "sentToDevice": "ডিভাইসে পাঠানো হয়েছে",
     "schemesHeading": "সরকারি প্রকল্পসমূহ",
     "fileGrievance": "অভিযোগ জানান",
     "suggestionLawTitle": "সমবায় আইন",

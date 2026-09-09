@@ -43,6 +43,8 @@ const gu: TranslationDict = {
     "voiceInput": "વોઇસ ઇનપુટ",
     "muteReplies": "વોઇસ રિપ્લાય મ્યૂટ કરો",
     "unmuteReplies": "વોઇસ રિપ્લાય અનમ્યૂટ કરો",
+    "playOnDevice": "ડિવાઇસ પર વગાડો",
+    "sentToDevice": "ડિવાઇસ પર મોકલ્યું",
     "schemesHeading": "યોજનાઓ",
     "fileGrievance": "ફરિયાદ નોંધાવો",
     "suggestionLawTitle": "સહકારી કાયદો",

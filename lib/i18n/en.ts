@@ -46,6 +46,8 @@ const en = {
     voiceInput: "Voice input",
     muteReplies: "Mute voice replies",
     unmuteReplies: "Unmute voice replies",
+    playOnDevice: "Play on device",
+    sentToDevice: "Sent to device",
     schemesHeading: "Schemes",
     fileGrievance: "File a grievance",
     suggestionLawTitle: "Cooperative law",

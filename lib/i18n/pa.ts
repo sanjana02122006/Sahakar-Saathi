@@ -43,6 +43,8 @@ const pa: TranslationDict = {
     "voiceInput": "ਵੌਇਸ ਇਨਪੁਟ",
     "muteReplies": "ਵੌਇਸ ਜਵਾਬ ਬੰਦ ਕਰੋ",
     "unmuteReplies": "ਵੌਇਸ ਜਵਾਬ ਚਾਲੂ ਕਰੋ",
+    "playOnDevice": "ਡਿਵਾਈਸ 'ਤੇ ਚਲਾਓ",
+    "sentToDevice": "ਡਿਵਾਈਸ 'ਤੇ ਭੇਜਿਆ ਗਿਆ",
     "schemesHeading": "ਸਕੀਮਾਂ",
     "fileGrievance": "ਸ਼ਿਕਾਇਤ ਦਰਜ ਕਰੋ",
     "suggestionLawTitle": "ਸਹਿਕਾਰੀ ਕਾਨੂੰਨ",
