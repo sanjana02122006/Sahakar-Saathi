@@ -7,7 +7,7 @@
 import fs from "node:fs";
 
 const TOKEN = process.env.SB_TOKEN;
-const REF = process.env.SB_REF || "njpxixfcctodjejtgmwj";
+const REF = process.env.SB_REF || "qstqjrlcdihyawszaqis";
 if (!TOKEN) { console.error("Missing SB_TOKEN env var."); process.exit(1); }
 
 const res = await fetch(`https://api.supabase.com/v1/projects/${REF}/api-keys?reveal=true`, {

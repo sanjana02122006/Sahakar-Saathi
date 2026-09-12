@@ -25,7 +25,7 @@ npm run dev
 
 ```bash
 supabase login
-supabase link --project-ref njpxixfcctodjejtgmwj
+supabase link --project-ref qstqjrlcdihyawszaqis
 supabase secrets set GEMINI_API_KEY=...
 supabase functions deploy chat
 supabase functions deploy ingest

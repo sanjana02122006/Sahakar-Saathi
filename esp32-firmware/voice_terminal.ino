@@ -81,9 +81,9 @@
 static const char *DEVICE_API_KEY = "92cc102c60dca20b778c31ea4fb85ae7962d83a14631803b3aaf3fe0bee40153";
 
 static const char *VOICE_UPLOAD_URL =
-    "https://njpxixfcctodjejtgmwj.supabase.co/functions/v1/voice-upload";
+    "https://qstqjrlcdihyawszaqis.supabase.co/functions/v1/voice-upload";
 static const char *VOICE_FETCH_URL =
-    "https://njpxixfcctodjejtgmwj.supabase.co/functions/v1/voice-fetch";
+    "https://qstqjrlcdihyawszaqis.supabase.co/functions/v1/voice-fetch";
 
 // BCP-47 code forwarded to Sarvam by voice-upload — change if the demo
 // account's language differs from English.
@@ -890,7 +890,7 @@ static bool uploadMultipart(File &f, size_t fileSize, String &outBody) {
   client.setInsecure();
   client.setConnectionTimeout(10000);
 
-  static const char *HOST = "njpxixfcctodjejtgmwj.supabase.co";
+  static const char *HOST = "qstqjrlcdihyawszaqis.supabase.co";
   static const char *PATH = "/functions/v1/voice-upload";
 
   String boundary = "----ESP32VoiceBoundary7f3a9c";
