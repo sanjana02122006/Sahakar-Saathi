@@ -13,6 +13,14 @@ import {
   Sprout, Send, Mic, MicOff, LogOut, Plus, Loader2, Settings, Volume2, VolumeX,
   Scale, FileText, ShieldCheck, Wallet, MessageSquareWarning, Check,
 } from "lucide-react";
+// Guide avatar — presentational-only test feature (see AVATAR-PLAN.md).
+// Produces no audio; only reflects existing sending/listening/deliveringId
+// state visually. AvatarSwitcher is test-only scaffolding to be removed
+// once a variant is picked.
+import { GuideAvatar, type AvatarState } from "@/components/avatar";
+import { AvatarSwitcher } from "@/components/avatar/switcher";
+import { SpeechBubble, ThinkingDots } from "@/components/avatar/speech-bubble";
+import { useAvatarVariant } from "@/lib/avatar-context";
 
 const SUGGESTIONS = [
   { icon: Scale, titleKey: "suggestionLawTitle", questionKey: "suggestionLawQuestion" },
@@ -60,6 +68,28 @@ export default function DashboardPage() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [transcribing, setTranscribing] = useState(false);
   const [muted, setMuted] = useState(false);
+
+  // ---------- guide avatar (presentational only, see AVATAR-PLAN.md) ----------
+  // Which message the avatar is currently animating alongside, or null.
+  // Keyed by message id (not a boolean) so the avatar animates next to the
+  // correct reply rather than all of them at once. Set/cleared only by
+  // listeners attached to the EXISTING audio/speechSynthesis paths below —
+  // never drives or delays audio itself.
+  const [deliveringId, setDeliveringId] = useState<string | null>(null);
+  // Reading-time-estimate fallback timer (Channel B: muted or no audio
+  // available at all). Stored in a ref so a new reply starting mid-
+  // animation can cancel the previous turn's timer before starting its own.
+  const deliverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { variant: avatarVariant } = useAvatarVariant();
+
+  // Clear the pending reading-time-estimate timer on unmount so its
+  // setTimeout callback never fires setDeliveringId after this component
+  // is gone (avoids a setState-after-unmount warning).
+  useEffect(() => {
+    return () => {
+      if (deliverTimeoutRef.current) clearTimeout(deliverTimeoutRef.current);
+    };
+  }, []);
 
   /* ---------- auth gate + initial load ---------- */
   useEffect(() => {
@@ -273,10 +303,47 @@ export default function DashboardPage() {
     return () => { supabase.removeChannel(channel); };
   }, [profile?.id, startSarvamRecording, stopSarvamRecording]);
 
-  function speakWithBrowser(text: string) {
-    if (!("speechSynthesis" in window)) return;
+  // Clears any pending reading-time-estimate timer and, if it was the one
+  // driving the avatar for `id`, clears deliveringId too. Guards against a
+  // new turn starting mid-animation stepping on a stale timeout from the
+  // previous one.
+  function clearDeliverEstimate() {
+    if (deliverTimeoutRef.current) {
+      clearTimeout(deliverTimeoutRef.current);
+      deliverTimeoutRef.current = null;
+    }
+  }
+
+  // Channel B (no audio at all): animate the avatar for a reading-time
+  // estimate instead of a real playback event, so it still animates
+  // "until the text is read", just by the human eye rather than a speech
+  // engine. Clamped 1800ms-12000ms based on word count.
+  function deliverByReadingEstimate(messageId: string | undefined, text: string) {
+    if (!messageId) return;
+    clearDeliverEstimate();
+    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+    const ms = Math.min(12000, Math.max(1800, (words / 3.5) * 1000));
+    setDeliveringId(messageId);
+    deliverTimeoutRef.current = setTimeout(() => {
+      setDeliveringId((cur) => (cur === messageId ? null : cur));
+      deliverTimeoutRef.current = null;
+    }, ms);
+  }
+
+  function speakWithBrowser(text: string, messageId?: string) {
+    if (!("speechSynthesis" in window)) {
+      // No TTS available at all — fall back to the reading-time estimate.
+      deliverByReadingEstimate(messageId, text);
+      return;
+    }
     const u = new SpeechSynthesisUtterance(text);
     u.lang = BCP47[lang] || "en-IN";
+    if (messageId) {
+      clearDeliverEstimate();
+      u.onstart = () => setDeliveringId(messageId);
+      u.onend = () => setDeliveringId((cur) => (cur === messageId ? null : cur));
+      u.onerror = () => setDeliveringId((cur) => (cur === messageId ? null : cur));
+    }
     speechSynthesis.speak(u);
   }
 
@@ -301,13 +368,23 @@ export default function DashboardPage() {
    *     back to speaking on the laptop would defeat the entire point of
    *     "the physical speaker is the output device" for this turn.
    */
-  async function speak(text: string, origin: TurnOrigin) {
+  async function speak(text: string, origin: TurnOrigin, messageId?: string) {
     if (origin === "esp32") {
+      // Channel B for the guide avatar: nothing plays on the laptop for an
+      // esp32-origin turn (see the long comment above) — the avatar still
+      // animates via the reading-time estimate so it isn't left idle while
+      // the ESP32's own speaker is delivering the reply.
+      deliverByReadingEstimate(messageId, text);
       await mirrorAudioToDevice(text);
       return;
     }
 
-    if (muted) return;
+    if (muted) {
+      // Channel B: muted means nothing will read this reply aloud at all —
+      // the avatar still animates via the reading-time estimate.
+      deliverByReadingEstimate(messageId, text);
+      return;
+    }
 
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) return;
@@ -321,16 +398,23 @@ export default function DashboardPage() {
 
       const data = await res.json();
       if (!res.ok || data.unsupported || !data.audio) {
-        speakWithBrowser(text);
+        speakWithBrowser(text, messageId);
         return;
       }
 
       if (audioRef.current) audioRef.current.pause();
       const audio = new Audio(`data:${data.mime};base64,${data.audio}`);
       audioRef.current = audio;
-      audio.play().catch(() => speakWithBrowser(text));
+      if (messageId) {
+        clearDeliverEstimate();
+        audio.onplay = () => setDeliveringId(messageId);
+        audio.onended = () => setDeliveringId((cur) => (cur === messageId ? null : cur));
+        audio.onerror = () => setDeliveringId((cur) => (cur === messageId ? null : cur));
+        audio.onpause = () => setDeliveringId((cur) => (cur === messageId ? null : cur));
+      }
+      audio.play().catch(() => speakWithBrowser(text, messageId));
     } catch {
-      speakWithBrowser(text);
+      speakWithBrowser(text, messageId);
     }
   }
 
@@ -480,7 +564,7 @@ export default function DashboardPage() {
         citations: data.citations ?? [], created_at: new Date().toISOString(),
       };
       setMessages((m) => [...m, reply]);
-      speak(finalReply, origin);
+      speak(finalReply, origin, reply.id);
     } catch {
       setMessages((m) => [...m, {
         id: crypto.randomUUID(), conversation_id: "", role: "assistant",
@@ -500,7 +584,12 @@ export default function DashboardPage() {
   if (booting) {
     return (
       <main className="flex min-h-screen items-center justify-center">
-        <div className="h-5 w-5 animate-spin rounded-full border-2 border-muted border-t-primary" />
+        <div className="flex items-center gap-3">
+          <GuideAvatar variant={avatarVariant} state="thinking" size={48} />
+          <SpeechBubble state="thinking">
+            <span className="text-sm text-muted-foreground">{t("avatar.gettingReady")}</span>
+          </SpeechBubble>
+        </div>
       </main>
     );
   }
@@ -515,12 +604,23 @@ export default function DashboardPage() {
         </div>
         <div className="flex items-center gap-2">
           <LanguageSwitcher />
+          {/* Test-only guide-avatar variant picker — see AVATAR-PLAN.md. */}
+          <AvatarSwitcher />
           <Button variant="ghost" size="sm" onClick={() => { setMessages([]); setConversationId(null); }}>
             <Plus className="h-4 w-4" /> {t("common.new")}
           </Button>
           <Button
             variant="ghost" size="icon"
-            onClick={() => { setMuted((m) => !m); audioRef.current?.pause(); speechSynthesis.cancel(); }}
+            onClick={() => {
+              setMuted((m) => !m);
+              audioRef.current?.pause();
+              speechSynthesis.cancel();
+              // Muting mid-delivery must stop the avatar's animation too —
+              // otherwise it keeps "delivering" forever since pause()/cancel()
+              // above don't reliably fire onpause/onend in every browser.
+              clearDeliverEstimate();
+              setDeliveringId(null);
+            }}
             title={muted ? t("dashboard.unmuteReplies") : t("dashboard.muteReplies")}
           >
             {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
@@ -583,10 +683,16 @@ export default function DashboardPage() {
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-6 sm:px-6">
             {messages.length === 0 ? (
               <div className="mx-auto max-w-2xl pt-8 sm:pt-16">
-                <h1 className="text-2xl font-semibold tracking-tight">
-                  {t("dashboard.namaste")}{profile?.full_name ? `, ${profile.full_name.split(" ")[0]}` : ""}.
-                </h1>
-                <p className="mt-1.5 text-sm text-muted-foreground">{t("dashboard.subtitle")}</p>
+                <div className="flex items-start gap-3">
+                  <GuideAvatar variant={avatarVariant} state="idle" size={48} />
+                  <div>
+                    <h1 className="text-2xl font-semibold tracking-tight">
+                      {t("dashboard.namaste")}{profile?.full_name ? `, ${profile.full_name.split(" ")[0]}` : ""}.
+                    </h1>
+                    <p className="mt-1 text-sm text-muted-foreground">{t("avatar.welcome")}</p>
+                  </div>
+                </div>
+                <p className="mt-3 text-sm text-muted-foreground">{t("dashboard.subtitle")}</p>
                 <div className="mt-6 grid gap-2 sm:grid-cols-2">
                   {SUGGESTIONS.map((s) => (
                     <button
@@ -605,8 +711,21 @@ export default function DashboardPage() {
               </div>
             ) : (
               <div className="mx-auto max-w-2xl space-y-5">
-                {messages.map((m) => (
-                  <div key={m.id} className={m.role === "user" ? "flex justify-end" : ""}>
+                {messages.map((m) => {
+                  // Guide avatar state for THIS message only — derived, not a
+                  // parallel state machine (see AVATAR-PLAN.md). Only ever
+                  // "delivering" for the specific assistant message currently
+                  // being read aloud (or animating on the reading-time
+                  // estimate); every other message just sits idle.
+                  const avatarState: AvatarState =
+                    m.role === "assistant" && deliveringId === m.id ? "delivering" : "idle";
+                  return (
+                  <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex items-start gap-2"}>
+                    {m.role === "assistant" && (
+                      <div className="mt-0.5 shrink-0">
+                        <GuideAvatar variant={avatarVariant} state={avatarState} size={32} />
+                      </div>
+                    )}
                     <div
                       className={
                         m.role === "user"
@@ -662,10 +781,14 @@ export default function DashboardPage() {
                       )}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
                 {sending && (
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> {t("dashboard.thinking")}
+                  <div className="flex items-center gap-2">
+                    <GuideAvatar variant={avatarVariant} state="thinking" size={32} />
+                    <SpeechBubble state="thinking">
+                      <ThinkingDots label={t("dashboard.thinking")} />
+                    </SpeechBubble>
                   </div>
                 )}
               </div>

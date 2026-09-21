@@ -127,6 +127,19 @@ const te: TranslationDict = {
     "PMFBY Operational Guidelines — Claims, Premium & Timelines": "PMFBY కార్యాచరణ మార్గదర్శకాలు — క్లెయిమ్‌లు, ప్రీమియం & కాలపరిమితులు",
     "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "కిసాన్ క్రెడిట్ కార్డ్ — అర్హత, పరిమితులు & ఆర్థిక అక్షరాస్యత",
     "Cooperative Grievance Redressal — Authorities & Escalation Path": "సహకార ఫిర్యాదుల పరిష్కారం — అధికారులు & పెంపు మార్గం"
+  },
+  "avatar": {
+    "welcome": "నమస్తే! నేను మీకు సహాయం చేయడానికి ఇక్కడ ఉన్నాను.",
+    "gettingReady": "సిద్ధం చేస్తున్నాను…",
+    "thinking": "నన్ను చూడనివ్వండి…",
+    "listening": "నేను వింటున్నాను…",
+    "chooseGuide": "మీ గైడ్‌ని ఎంచుకోండి",
+    "name": {
+      "sprout": "సహకార్ మిత్ర",
+      "robot": "సేవా",
+      "human": "మిత్ర దీది",
+      "lotus": "కమల్"
+    }
   }
 };
 

@@ -127,6 +127,19 @@ const pa: TranslationDict = {
     "PMFBY Operational Guidelines — Claims, Premium & Timelines": "PMFBY ਸੰਚਾਲਨ ਦਿਸ਼ਾ-ਨਿਰਦੇਸ਼ — ਦਾਅਵੇ, ਪ੍ਰੀਮੀਅਮ ਅਤੇ ਸਮਾਂ-ਸੀਮਾ",
     "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "ਕਿਸਾਨ ਕ੍ਰੈਡਿਟ ਕਾਰਡ — ਯੋਗਤਾ, ਸੀਮਾਵਾਂ ਅਤੇ ਵਿੱਤੀ ਸਾਖਰਤਾ",
     "Cooperative Grievance Redressal — Authorities & Escalation Path": "ਸਹਿਕਾਰੀ ਸ਼ਿਕਾਇਤ ਨਿਵਾਰਣ — ਅਥਾਰਟੀਆਂ ਅਤੇ ਵਾਧਾ ਪ੍ਰਕਿਰਿਆ"
+  },
+  "avatar": {
+    "welcome": "ਨਮਸਤੇ! ਮੈਂ ਤੁਹਾਡੀ ਮਦਦ ਲਈ ਇੱਥੇ ਹਾਂ।",
+    "gettingReady": "ਤਿਆਰੀ ਹੋ ਰਹੀ ਹੈ…",
+    "thinking": "ਮੈਨੂੰ ਇਹ ਵੇਖਣ ਦਿਓ…",
+    "listening": "ਮੈਂ ਸੁਣ ਰਿਹਾ ਹਾਂ…",
+    "chooseGuide": "ਆਪਣਾ ਗਾਈਡ ਚੁਣੋ",
+    "name": {
+      "sprout": "ਸਹਿਕਾਰ ਮਿੱਤਰ",
+      "robot": "ਸੇਵਾ",
+      "human": "ਮਿੱਤਰ ਦੀਦੀ",
+      "lotus": "ਕਮਲ"
+    }
   }
 };
 

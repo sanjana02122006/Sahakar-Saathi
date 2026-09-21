@@ -10,10 +10,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Sprout, Loader2 } from "lucide-react";
+// Guide avatar — presentational-only test feature (see AVATAR-PLAN.md).
+import { GuideAvatar } from "@/components/avatar";
+import { SpeechBubble } from "@/components/avatar/speech-bubble";
+import { useAvatarVariant } from "@/lib/avatar-context";
 
 export default function LoginPage() {
   const router = useRouter();
   const { t } = useI18n();
+  const { variant: avatarVariant } = useAvatarVariant();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -45,6 +50,12 @@ export default function LoginPage() {
           <span className="text-lg font-semibold tracking-tight">{t("app.name")}</span>
         </div>
         <div className="space-y-5">
+          <div className="flex items-start gap-3">
+            <GuideAvatar variant={avatarVariant} state="idle" size={44} />
+            <SpeechBubble state="idle" className="bg-primary-foreground/10">
+              <span className="text-sm text-primary-foreground/90">{t("avatar.welcome")}</span>
+            </SpeechBubble>
+          </div>
           <h1 className="max-w-md text-4xl font-semibold leading-tight tracking-tight">
             {t("app.tagline")}
           </h1>

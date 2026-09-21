@@ -131,6 +131,19 @@ const kn: TranslationDict = {
     "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "ಕಿಸಾನ್ ಕ್ರೆಡಿಟ್ ಕಾರ್ಡ್ — ಅರ್ಹತೆ, ಮಿತಿಗಳು ಮತ್ತು ಆರ್ಥಿಕ ಸಾಕ್ಷರತೆ",
     "Cooperative Grievance Redressal — Authorities & Escalation Path": "ಸಹಕಾರ ಕುಂದುಕೊರತೆ ಪರಿಹಾರ — ಅಧಿಕಾರಿಗಳು ಮತ್ತು ಹೆಚ್ಚಳ ಮಾರ್ಗ",
   },
+  avatar: {
+    welcome: "ನಮಸ್ತೆ! ನಾನು ನಿಮಗೆ ಸಹಾಯ ಮಾಡಲು ಇಲ್ಲಿದ್ದೇನೆ.",
+    gettingReady: "ಸಿದ್ಧತೆ ನಡೆಯುತ್ತಿದೆ…",
+    thinking: "ನನ್ನನ್ನು ಪರಿಶೀಲಿಸಲು ಬಿಡಿ…",
+    listening: "ನಾನು ಕೇಳುತ್ತಿದ್ದೇನೆ…",
+    chooseGuide: "ನಿಮ್ಮ ಗೈಡ್ ಆಯ್ಕೆಮಾಡಿ",
+    name: {
+      sprout: "ಸಹಕಾರ್ ಮಿತ್ರ",
+      robot: "ಸೇವಾ",
+      human: "ಮಿತ್ರ ದೀದಿ",
+      lotus: "ಕಮಲ್",
+    },
+  },
 };
 
 export default kn;

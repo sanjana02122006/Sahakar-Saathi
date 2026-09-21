@@ -157,6 +157,23 @@ const en = {
     "Kisan Credit Card — Eligibility, Limits & Financial Literacy": "Kisan Credit Card — Eligibility, Limits & Financial Literacy",
     "Cooperative Grievance Redressal — Authorities & Escalation Path": "Cooperative Grievance Redressal — Authorities & Escalation Path",
   },
+
+  // Guide avatar — TEST-ONLY feature for comparing four mascot designs on
+  // the deployed test site (see AVATAR-PLAN.md). Names are the mascots'
+  // in-universe names, not literal translations of "sprout/robot/human/lotus".
+  avatar: {
+    welcome: "Namaste! I'm here to help.",
+    gettingReady: "Getting things ready…",
+    thinking: "Let me look that up…",
+    listening: "I'm listening…",
+    chooseGuide: "Choose your guide",
+    name: {
+      sprout: "Sahakar Mitra",
+      robot: "Seva",
+      human: "Mitra Didi",
+      lotus: "Kamal",
+    },
+  },
 } as const;
 
 export default en;
