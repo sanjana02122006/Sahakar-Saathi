@@ -117,7 +117,11 @@ Deno.serve(async (req) => {
     }
 
     // ---------- retrieve (best-effort; chat still works with an empty KB) ----------
-    let citations: { title: string; source_url: string | null; similarity: number }[] = [];
+    let citations: {
+      title: string; source_url: string | null; similarity: number;
+      anchored: boolean; document_id: string | null;
+      chain_tx_hash: string | null; chain_network: string | null;
+    }[] = [];
     let context = "";
 
     try {
@@ -154,6 +158,10 @@ Deno.serve(async (req) => {
                 title: c.title,
                 source_url: c.source_url ?? null,
                 similarity: Number(c.similarity?.toFixed?.(3) ?? 0),
+                anchored: Boolean(c.chain_tx_hash),        // "a tx hash exists", NOT "verified right now" — see BLOCKCHAIN-PLAN.md
+                document_id: c.document_id ?? null,        // needed so the frontend can call verify-document
+                chain_tx_hash: c.chain_tx_hash ?? null,
+                chain_network: c.chain_network ?? null,
               }));
           }
         }

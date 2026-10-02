@@ -20,7 +20,19 @@ export interface Profile {
   role: AppRole;
 }
 
-export interface Citation { title: string; source_url: string | null; similarity: number; }
+export interface Citation {
+  title: string;
+  source_url: string | null;
+  similarity: number;
+  // Blockchain-anchoring fields (see BLOCKCHAIN-PLAN.md). `anchored` means
+  // only "a chain_tx_hash exists on this document's row" — it is NOT a
+  // live integrity check. A live check is a separate verify-document call
+  // keyed by document_id; see lib/verify-document.ts.
+  anchored?: boolean;
+  document_id?: string | null;
+  chain_tx_hash?: string | null;
+  chain_network?: string | null;
+}
 
 export interface Message {
   id: string;

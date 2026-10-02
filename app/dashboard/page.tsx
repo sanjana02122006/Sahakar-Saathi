@@ -21,6 +21,10 @@ import { GuideAvatar, type AvatarState } from "@/components/avatar";
 import { AvatarSwitcher } from "@/components/avatar/switcher";
 import { SpeechBubble, ThinkingDots } from "@/components/avatar/speech-bubble";
 import { useAvatarVariant } from "@/lib/avatar-context";
+// Blockchain document-integrity badge (see BLOCKCHAIN-PLAN.md). Additive
+// to the citation chip below — does not replace or restyle it.
+import { VerifyBadge } from "@/components/verify-badge";
+import { useVerifyDocument } from "@/lib/verify-document";
 
 const SUGGESTIONS = [
   { icon: Scale, titleKey: "suggestionLawTitle", questionKey: "suggestionLawQuestion" },
@@ -44,6 +48,17 @@ const BCP47: Record<string, string> = {
 // inside an async callback could be clobbered by a second, unrelated
 // turn starting before the first one's reply comes back.
 type TurnOrigin = "browser" | "esp32";
+
+// Blockchain-anchoring badge for one citation chip (see BLOCKCHAIN-PLAN.md).
+// A separate component — not inlined into the citations.map() below — because
+// useVerifyDocument() is a hook and therefore cannot be called directly
+// inside a .map() callback in the parent component's body. Renders nothing
+// when the citation was never chain-anchored at all (anchored !== true),
+// exactly as the spec's state table requires: no badge, not a neutral one.
+function CitationAnchorBadge({ documentId }: { documentId: string }) {
+  const { result, status } = useVerifyDocument(documentId);
+  return <VerifyBadge status={status} explorerUrl={result?.explorer_url} />;
+}
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -766,15 +781,23 @@ export default function DashboardPage() {
                             // text for any title not yet translated.
                             const localizedTitle = (DICTS[lang] as any)?.citations?.[c.title] ?? c.title;
                             return (
-                              <a
-                                key={i}
-                                href={c.source_url ?? "#"}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="rounded-full border px-2.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-secondary"
-                              >
-                                {localizedTitle}
-                              </a>
+                              // Fragment wraps the EXISTING citation chip (untouched) plus the
+                              // new blockchain-anchoring badge appended after it (see
+                              // BLOCKCHAIN-PLAN.md) -- the chip's own <a> tag, className, and
+                              // href are unmodified below.
+                              <span key={i} className="inline-flex items-center gap-1">
+                                <a
+                                  href={c.source_url ?? "#"}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="rounded-full border px-2.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-secondary"
+                                >
+                                  {localizedTitle}
+                                </a>
+                                {c.anchored && c.document_id && (
+                                  <CitationAnchorBadge documentId={c.document_id} />
+                                )}
+                              </span>
                             );
                           })}
                         </div>

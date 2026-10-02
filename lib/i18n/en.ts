@@ -175,6 +175,48 @@ const en = {
       micah: "Radha",
     },
   },
+
+  // Blockchain document-integrity badge on citation chips (see
+  // BLOCKCHAIN-PLAN.md). Three states, not one — "pending" (anchored,
+  // not yet live-checked this session), "verified" (a fresh re-hash just
+  // matched both the DB row and the on-chain record), and "failed" (a
+  // real mismatch — the thing this feature exists to catch). The
+  // "verified" tooltip deliberately explains what it does NOT mean:
+  // this checks byte-identity, not legal correctness.
+  verified: {
+    badge: {
+      pending: "Anchored",
+      verified: "Blockchain Verified",
+      failed: "Integrity check failed",
+    },
+    tooltip: {
+      pending: "This document's hash was recorded on Polygon Amoy (testnet). Checking it still matches…",
+      verified: "This document matches what was originally registered on-chain. This confirms the file hasn't been altered — it does not verify legal correctness.",
+      failed: "This document no longer matches its registered record — treat this answer's source with caution.",
+    },
+  },
+
+  // Admin-only PDF upload + chain-anchoring page (see BLOCKCHAIN-PLAN.md).
+  admin: {
+    verifyTitle: "Upload & Anchor Document",
+    verifySubtitle: "Upload an official PDF to the knowledge base and record its hash on Polygon Amoy (testnet).",
+    notAdmin: "Admin access required.",
+    titleLabel: "Title",
+    categoryLabel: "Category",
+    fileLabel: "PDF file",
+    chooseFile: "Choose PDF",
+    uploading: "Uploading…",
+    ingesting: "Processing document…",
+    anchoring: "Anchoring on-chain…",
+    submit: "Upload & Anchor",
+    alreadyIngested: "This exact PDF is already in the knowledge base — skipped re-processing.",
+    anchoredSuccess: "Anchored successfully.",
+    alreadyAnchored: "This document was already anchored.",
+    viewOnPolygonscan: "View on Polygonscan",
+    scannedPdfError: "This PDF appears to be scanned images with no extractable text. OCR is required before it can be ingested.",
+    signerNotConfigured: "The chain signer wallet isn't configured yet. Document was ingested but not anchored.",
+    genericError: "Something went wrong. Please try again.",
+  },
 } as const;
 
 export default en;
