@@ -138,7 +138,8 @@ const pa: TranslationDict = {
       "sprout": "ਸਹਿਕਾਰ ਮਿੱਤਰ",
       "robot": "ਸੇਵਾ",
       "human": "ਮਿੱਤਰ ਦੀਦੀ",
-      "lotus": "ਕਮਲ"
+      "lotus": "ਕਮਲ",
+      "micah": "ਰਾਧਾ"
     }
   }
 };

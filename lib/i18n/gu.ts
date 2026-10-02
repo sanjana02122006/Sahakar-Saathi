@@ -138,7 +138,8 @@ const gu: TranslationDict = {
       "sprout": "સહકાર મિત્ર",
       "robot": "સેવા",
       "human": "મિત્ર દીદી",
-      "lotus": "કમળ"
+      "lotus": "કમળ",
+      "micah": "રાધા"
     }
   }
 };

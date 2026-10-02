@@ -138,7 +138,8 @@ const hi: TranslationDict = {
       "sprout": "सहकार मित्र",
       "robot": "सेवा",
       "human": "मित्र दीदी",
-      "lotus": "कमल"
+      "lotus": "कमल",
+      "micah": "राधा"
     }
   }
 };

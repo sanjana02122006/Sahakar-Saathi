@@ -142,6 +142,7 @@ const kn: TranslationDict = {
       robot: "ಸೇವಾ",
       human: "ಮಿತ್ರ ದೀದಿ",
       lotus: "ಕಮಲ್",
+      micah: "ರಾಧಾ",
     },
   },
 };

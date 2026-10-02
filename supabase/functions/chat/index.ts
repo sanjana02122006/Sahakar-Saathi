@@ -50,7 +50,7 @@ const json = (body: unknown, status = 200) =>
   });
 
 function systemPrompt(langName: string, context: string) {
-  return `You are "Sahakar Sathi", an assistant for the Ministry of Cooperation (India), helping cooperative members, farmers and rural stakeholders.
+  return `You are "Sahakar Saathi", an assistant for the Ministry of Cooperation (India), helping cooperative members, farmers and rural stakeholders.
 
 Scope: cooperative laws and by-laws, Ministry of Cooperation schemes, PACS services, PMFBY crop insurance, financial literacy, and grievance redressal.
 

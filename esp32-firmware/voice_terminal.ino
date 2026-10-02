@@ -1,5 +1,5 @@
 /* =====================================================================
-   Sahakar Sathi — ESP32-C3 Voice Terminal
+   Sahakar Saathi — ESP32-C3 Voice Terminal
    Push-to-talk hardware client for cglachatbot.netlify.app
 
    Board:            ESP32C3 Dev Module
@@ -266,7 +266,7 @@ bool streamPlayResponse(HTTPClient &http);
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== Sahakar Sathi Voice Terminal booting ===");
+  Serial.println("\n=== Sahakar Saathi Voice Terminal booting ===");
 
   // INPUT_PULLDOWN (not plain INPUT): actively holds the pin LOW via the
   // ESP32's own internal pulldown whenever the TTP223 isn't driving it

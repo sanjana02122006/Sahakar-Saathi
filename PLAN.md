@@ -1,4 +1,4 @@
-# Sahakar Sathi — Implementation Plan
+# Sahakar Saathi — Implementation Plan
 
 **SIH 2026 · PS 26088** — Multilingual Cooperative Governance & Legal Assistance Chatbot
 **Org:** Ministry of Cooperation · **Dept:** NCCT · **Theme:** Agriculture, FoodTech & Rural Development

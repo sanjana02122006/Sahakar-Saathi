@@ -138,7 +138,8 @@ const te: TranslationDict = {
       "sprout": "సహకార్ మిత్ర",
       "robot": "సేవా",
       "human": "మిత్ర దీది",
-      "lotus": "కమల్"
+      "lotus": "కమల్",
+      "micah": "రాధా"
     }
   }
 };

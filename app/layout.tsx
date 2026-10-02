@@ -6,7 +6,7 @@ import { AvatarProvider } from "@/lib/avatar-context";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Sahakar Sathi — Cooperative Governance Assistant",
+  title: "Sahakar Saathi — Cooperative Governance Assistant",
   description:
     "Multilingual AI assistant for cooperative laws, Ministry of Cooperation schemes, PACS services, PMFBY and grievance redressal.",
 };

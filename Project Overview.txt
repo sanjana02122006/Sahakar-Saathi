@@ -1,5 +1,5 @@
 ================================================================================
- SAHAKAR SATHI
+ SAHAKAR SAATHI
  Multilingual Cooperative Governance & Legal Assistance Chatbot
 ================================================================================
 
@@ -22,7 +22,7 @@ Agricultural Credit Society) services, crop insurance, financial products, or
 how to file a grievance — mainly because of language barriers and uneven
 access to reliable guidance.
 
-Sahakar Sathi is an AI assistant that answers these questions directly, in the
+Sahakar Saathi is an AI assistant that answers these questions directly, in the
 user's own language, by text or voice, grounded in real source documents
 (Acts, by-laws, scheme guidelines) rather than the model's general knowledge
 alone. It is built as a working MVP, not a mockup: every piece described below

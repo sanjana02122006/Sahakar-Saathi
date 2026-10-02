@@ -1,4 +1,4 @@
-# Sahakar Sathi
+# Sahakar Saathi
 
 Multilingual cooperative governance & legal assistance chatbot.
 SIH 2026 · PS 26088 · Ministry of Cooperation / NCCT.

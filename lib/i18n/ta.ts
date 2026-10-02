@@ -138,7 +138,8 @@ const ta: TranslationDict = {
       "sprout": "சஹகார் மித்ரா",
       "robot": "சேவா",
       "human": "மித்ரா தீதி",
-      "lotus": "கமல்"
+      "lotus": "கமல்",
+      "micah": "ராதா"
     }
   }
 };

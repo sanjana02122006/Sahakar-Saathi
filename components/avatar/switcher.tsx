@@ -14,7 +14,10 @@ import { useI18n } from "@/lib/i18n/provider";
 import { GuideAvatar } from "./index";
 import { cn } from "@/lib/utils";
 
-const VARIANTS: { code: AvatarVariant; nameKey: string }[] = [
+// credit: only "micah" requires attribution (CC BY 4.0) — every other
+// variant is CC0 or a custom asset and carries no credit line.
+const VARIANTS: { code: AvatarVariant; nameKey: string; credit?: string }[] = [
+  { code: "micah", nameKey: "avatar.name.micah", credit: "Illustration by Micah Lanier, CC BY 4.0" },
   { code: "sprout", nameKey: "avatar.name.sprout" },
   { code: "robot", nameKey: "avatar.name.robot" },
   { code: "human", nameKey: "avatar.name.human" },
@@ -68,7 +71,14 @@ export function AvatarSwitcher({ className }: { className?: string }) {
               )}
             >
               <GuideAvatar variant={v.code} state="idle" size={28} />
-              <span className="flex-1">{t(v.nameKey)}</span>
+              <span className="flex-1">
+                <span className="block">{t(v.nameKey)}</span>
+                {v.credit && (
+                  <span className="block text-[10px] font-normal leading-tight text-muted-foreground">
+                    {v.credit}
+                  </span>
+                )}
+              </span>
               {v.code === variant && <Check className="h-3.5 w-3.5 text-primary" />}
             </button>
           ))}

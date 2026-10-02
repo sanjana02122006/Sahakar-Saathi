@@ -4,19 +4,23 @@ import { createContext, useContext, useEffect, useState, useCallback } from "rea
 
 /**
  * Guide avatar variant selection — TEST-ONLY scaffolding for comparing the
- * four avatar designs on the deployed site (see AVATAR-PLAN.md). Persists
- * to localStorage only; deliberately does NOT touch profiles.preferred_lang
+ * avatar designs on the deployed site (see AVATAR-PLAN.md). Persists to
+ * localStorage only; deliberately does NOT touch profiles.preferred_lang
  * or any other server-side state, since this whole feature is meant to be
  * `git reset --hard`-able back to the pre-avatar checkpoint commit.
+ *
+ * "micah" (DiceBear Micah, by Micah Lanier) is CC BY 4.0 — UNLIKE every
+ * other variant here, its license requires visible attribution. See the
+ * credit line rendered next to it in switcher.tsx; don't drop that credit.
  */
-export type AvatarVariant = "sprout" | "robot" | "human" | "lotus";
+export type AvatarVariant = "sprout" | "robot" | "human" | "lotus" | "micah";
 export type AvatarState = "idle" | "listening" | "thinking" | "delivering";
 
 const STORAGE_KEY = "sahakar-sathi-guide-avatar";
-const DEFAULT_VARIANT: AvatarVariant = "sprout";
+const DEFAULT_VARIANT: AvatarVariant = "micah";
 
 function isAvatarVariant(v: unknown): v is AvatarVariant {
-  return v === "sprout" || v === "robot" || v === "human" || v === "lotus";
+  return v === "sprout" || v === "robot" || v === "human" || v === "lotus" || v === "micah";
 }
 
 type Ctx = {

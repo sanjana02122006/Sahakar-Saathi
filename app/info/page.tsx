@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Sahakar Sathi — Field Guide",
+  title: "Sahakar Saathi — Field Guide",
   description:
     "Plain-language walkthrough of the whole system — hardware pins, the voice round trip, and the AI pipeline.",
 };
@@ -520,7 +520,7 @@ export default function InfoPage() {
       <div className="topbar">
         <div className="brand">
           <span className="brand-mark">सह</span>
-          <span className="brand-name">Sahakar Sathi</span>
+          <span className="brand-name">Sahakar Saathi</span>
           <span className="brand-sub">— field guide for the team</span>
         </div>
         <div className="topbar-right">SIH 2026 · Problem Statement 26088<br />Ministry of Cooperation / NCCT</div>

@@ -5,6 +5,7 @@ import { SproutAvatar } from "./sprout";
 import { RobotAvatar } from "./robot";
 import { HumanAvatar } from "./human";
 import { LotusAvatar } from "./lotus";
+import { MicahAvatar } from "./micah";
 
 export type { AvatarVariant, AvatarState };
 
@@ -38,8 +39,9 @@ export function GuideAvatar({
       case "robot": return <RobotAvatar state={state} size={size} />;
       case "human": return <HumanAvatar state={state} size={size} />;
       case "lotus": return <LotusAvatar state={state} size={size} />;
-      case "sprout":
-      default: return <SproutAvatar state={state} size={size} />;
+      case "sprout": return <SproutAvatar state={state} size={size} />;
+      case "micah":
+      default: return <MicahAvatar state={state} size={size} />;
     }
   })();
 
